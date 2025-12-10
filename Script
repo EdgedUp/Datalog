@@ -1,0 +1,1139 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_pdf import PdfPages
+import seaborn as sns
+import os
+
+# Plot style
+sns.set_theme(style="whitegrid")
+plt.rcParams.update({"figure.autolayout": True})
+
+
+class QualAnalyzerV20:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Microcircuit Qual Analyzer V20 (Smart Limits + Inspector Slider Fix)")
+        self.root.geometry("1600x950")
+
+        # Data Storage
+        self.data_dict = {}        # per sheet: wide data (SN + numeric cols)
+        self.limits_dict = {}      # per sheet: {Parameter -> (LSL, USL)}
+        self.param_map = {}        # base param -> [sheets]
+        self.raw_previews = {}     # per sheet: raw DataFrame (no header)
+        self.failures = []         # list of failure dicts
+        self.current_file = None
+
+        # Long-format tables
+        self.measure_long = None   # DataFrame: Sheet, SN, Parameter, Value
+        self.limit_long = None     # DataFrame: Sheet, Parameter, LSL, USL
+        self.fail_long = None      # DataFrame: full failure table
+
+        # Config Vars
+        self.var_header_row = tk.IntVar(value=8)
+        self.var_usl_row = tk.IntVar(value=12)
+        self.var_lsl_row = tk.IntVar(value=13)
+        self.var_data_start = tk.IntVar(value=18)
+        self.var_data_end = tk.IntVar(value=0)
+        self.var_sn_col = tk.IntVar(value=0)
+
+        # Inspector sizing controls
+        self.var_col_width = tk.IntVar(value=500)   # px
+        self.var_row_height = tk.IntVar(value=22)   # px
+
+        # Pagination
+        self.page_size = 100
+        self.current_page = 0
+        self.total_rows = 0
+
+        self.temps = ["Room", "Cold", "Hot"]
+        self.is_tritemp = False
+
+        # Matplotlib canvas references
+        self.cpk_fig = None
+        self.cpk_canvas = None
+        self.trend_fig = None
+        self.trend_canvas = None
+        self.viz_fig = None
+        self.viz_canvas = None
+
+        # Distribution controls
+        self.var_xmode = tk.StringVar(value="Sheet")
+        self.var_show_limits = tk.StringVar(value="Off")
+
+        # Treeview style for row height
+        self.style = ttk.Style()
+        self.style.configure("Inspector.Treeview", rowheight=self.var_row_height.get())
+        self.style.configure("Treeview", rowheight=22)
+
+        # --- Top controls ---
+        control_frame = ttk.Frame(self.root, padding="10")
+        control_frame.pack(fill=tk.X)
+
+        btn_load = ttk.Button(control_frame, text="Load Data File (.xlsx)", command=self.load_file)
+        btn_load.pack(side=tk.LEFT, padx=5)
+
+        btn_reload = ttk.Button(control_frame, text="Reload Last File", command=self.reload_last_file)
+        btn_reload.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(control_frame, text="Page Size:").pack(side=tk.LEFT, padx=(20, 2))
+        self.var_page_size = tk.IntVar(value=self.page_size)
+        ttk.Entry(control_frame, textvariable=self.var_page_size, width=6).pack(side=tk.LEFT)
+
+        ttk.Label(control_frame, text="Go to Page:").pack(side=tk.LEFT, padx=(20, 2))
+        self.var_goto_page = tk.IntVar(value=1)
+        ttk.Entry(control_frame, textvariable=self.var_goto_page, width=6).pack(side=tk.LEFT)
+        ttk.Button(control_frame, text="Go", command=self.goto_page).pack(side=tk.LEFT, padx=2)
+
+        self.lbl_status = ttk.Label(control_frame, text="Ready. Please load a file.")
+        self.lbl_status.pack(side=tk.LEFT, padx=15)
+
+        # Tabs
+        self.tabs = ttk.Notebook(self.root)
+        self.tabs.pack(expand=1, fill="both")
+
+        self.tab_inspect = ttk.Frame(self.tabs)
+        self.tab_cpk = ttk.Frame(self.tabs)
+        self.tab_fail = ttk.Frame(self.tabs)
+        self.tab_assess = ttk.Frame(self.tabs)
+        self.tab_trend = ttk.Frame(self.tabs)
+        self.tab_report = ttk.Frame(self.tabs)
+        self.tab_visuals = ttk.Frame(self.tabs)
+
+        self.tabs.add(self.tab_inspect, text="Data Inspector")
+        self.tabs.add(self.tab_cpk, text="Cpk Health Check")
+        self.tabs.add(self.tab_fail, text="Failure Analysis")
+        self.tabs.add(self.tab_assess, text="Lot Assessment")
+        self.tabs.add(self.tab_trend, text="Detailed Trend")
+        self.tabs.add(self.tab_report, text="Report Generator")
+        self.tabs.add(self.tab_visuals, text="Distributions")
+
+        self._setup_inspect_tab()
+        self._setup_cpk_tab()
+        self._setup_fail_tab()
+        self._setup_assess_tab()
+        self._setup_trend_tab()
+        self._setup_report_tab()
+        self._setup_visuals_tab()
+
+    # ----------------- Inspector tab -----------------
+    def _setup_inspect_tab(self):
+        frame = ttk.Frame(self.tab_inspect)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        config = ttk.LabelFrame(frame, text="Parsing Config", padding=10)
+        config.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+
+        def entry(lbl, var):
+            f = ttk.Frame(config)
+            f.pack(fill=tk.X, pady=2)
+            ttk.Label(f, text=lbl, width=18).pack(side=tk.LEFT)
+            ttk.Entry(f, textvariable=var, width=8).pack(side=tk.RIGHT)
+
+        entry("Header Row:", self.var_header_row)
+        entry("Max Limit (Row):", self.var_usl_row)
+        entry("Min Limit (Row):", self.var_lsl_row)
+        entry("Data Start (Row):", self.var_data_start)
+        entry("Data End (0=Auto):", self.var_data_end)
+        entry("SN Column Idx:", self.var_sn_col)
+
+        ttk.Button(config, text="Apply Changes", command=self.reparse_file).pack(fill=tk.X, pady=10)
+
+        # Row-height slider only (column width slider is in top bar)
+        size_box = ttk.LabelFrame(config, text="Inspector Size", padding=5)
+        size_box.pack(fill=tk.X, pady=10)
+
+        ttk.Label(size_box, text="Row Height").pack(anchor="w", pady=(0, 0))
+        row_scale = ttk.Scale(
+            size_box,
+            from_=16,
+            to=60,
+            orient="horizontal",
+            variable=self.var_row_height,
+            command=lambda v: self._apply_inspector_row_height(),
+        )
+        row_scale.pack(fill=tk.X, pady=2)
+
+        leg = ttk.LabelFrame(config, text="Legend", padding=5)
+        leg.pack(fill=tk.X, pady=10)
+        self._add_legend(leg, "Header Row", "#ffffcc")
+        self._add_legend(leg, "Limits", "#ffcccc")
+        self._add_legend(leg, "Data Start", "#ccffcc")
+        self._add_legend(leg, "Data End", "#000000")
+
+        right = ttk.Frame(frame)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        bar = ttk.Frame(right, padding=5)
+        bar.pack(fill=tk.X)
+        self.combo_inspect_sheet = ttk.Combobox(bar, state="readonly", width=20)
+        self.combo_inspect_sheet.pack(side=tk.LEFT)
+        self.combo_inspect_sheet.bind("<<ComboboxSelected>>", self.on_sheet_change)
+
+        ttk.Button(bar, text="< Prev", command=self.prev_page).pack(side=tk.LEFT, padx=5)
+        self.lbl_page = ttk.Label(bar, text="Page 1")
+        self.lbl_page.pack(side=tk.LEFT)
+        ttk.Button(bar, text="Next >", command=self.next_page).pack(side=tk.LEFT, padx=5)
+
+        # Column width slider in top bar
+        ttk.Label(bar, text="Col Width:").pack(side=tk.LEFT, padx=(15, 2))
+        self.scale_col_width = tk.Scale(
+            bar,
+            from_=50,
+            to=900,
+            orient=tk.HORIZONTAL,
+            showvalue=True,
+            command=self.update_col_width
+        )
+        self.scale_col_width.set(self.var_col_width.get())
+        self.scale_col_width.pack(side=tk.LEFT, padx=5)
+
+        grid_f = ttk.Frame(right)
+        grid_f.pack(fill=tk.BOTH, expand=True)
+
+        self.tree_raw = ttk.Treeview(grid_f, show="headings", style="Inspector.Treeview")
+        vsb = ttk.Scrollbar(grid_f, orient="vertical", command=self.tree_raw.yview)
+        hsb = ttk.Scrollbar(grid_f, orient="horizontal", command=self.tree_raw.xview)
+        self.tree_raw.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree_raw.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.tree_raw.tag_configure("HEADER", background="#ffffcc")
+        self.tree_raw.tag_configure("USL", background="#ffcccc")
+        self.tree_raw.tag_configure("LSL", background="#ccccff")
+        self.tree_raw.tag_configure("DATA_START", background="#ccffcc")
+        self.tree_raw.tag_configure("DATA_END", background="black", foreground="white")
+
+    def _add_legend(self, parent, text, color):
+        f = ttk.Frame(parent)
+        f.pack(anchor="w")
+        tk.Label(f, bg=color, width=2).pack(side=tk.LEFT)
+        ttk.Label(f, text=text).pack(side=tk.LEFT, padx=5)
+
+    def update_col_width(self, val):
+        """Real-time update of inspector column widths from slider."""
+        try:
+            w = int(float(val))
+        except ValueError:
+            return
+        self.var_col_width.set(w)
+        # Critical: stretch=False prevents auto-shrinking when widget resizes
+        for col in self.tree_raw["columns"]:
+            self.tree_raw.column(col, width=w, stretch=False, anchor="w")
+        self.tree_raw.update_idletasks()
+
+    def _apply_inspector_row_height(self):
+        rh = int(self.var_row_height.get())
+        self.style.configure("Inspector.Treeview", rowheight=rh)
+        self.tree_raw.update_idletasks()
+
+    # ----------------- Other tabs setup -----------------
+    def _setup_cpk_tab(self):
+        frame = ttk.Frame(self.tab_cpk)
+        frame.pack(fill=tk.BOTH, expand=True)
+        paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        self.cpk_plot_frame = ttk.Frame(paned)
+        paned.add(self.cpk_plot_frame, weight=3)
+
+        tree_frame = ttk.Frame(paned)
+        self.tree_cpk = ttk.Treeview(tree_frame, columns=("Param", "Cpk", "Mean"), show="headings")
+        for c in ("Param", "Cpk", "Mean"):
+            self.tree_cpk.heading(c, text=c, command=lambda col=c: self._sort_cpk_tree(col, False))
+            self.tree_cpk.column(c, anchor="w", width=120)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree_cpk.yview)
+        self.tree_cpk.configure(yscrollcommand=sb.set)
+        self.tree_cpk.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        paned.add(tree_frame, weight=1)
+
+    def _setup_fail_tab(self):
+        frame = ttk.Frame(self.tab_fail)
+        frame.pack(fill=tk.BOTH, expand=True)
+        top = ttk.Frame(frame)
+        top.pack(fill=tk.X)
+        self.lbl_fail_summary = ttk.Label(frame, text="Total Failures: 0", font=("Arial", 12, "bold"))
+        self.lbl_fail_summary.pack(in_=top, side=tk.LEFT, pady=10, padx=5)
+        ttk.Button(top, text="Export Failures to CSV", command=self.export_failures_csv).pack(side=tk.LEFT, padx=5)
+
+        cols = ("Sheet", "SN", "Parameter", "Value", "LSL", "USL", "Type")
+        self.tree_fail = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            self.tree_fail.heading(c, text=c)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree_fail.yview)
+        self.tree_fail.configure(yscrollcommand=vsb.set)
+        self.tree_fail.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _setup_assess_tab(self):
+        frame = ttk.Frame(self.tab_assess)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(frame)
+        top.pack(fill=tk.X, pady=5)
+        ttk.Button(top, text="Export Assessment to CSV", command=self.export_assessment_csv).pack(side=tk.LEFT, padx=5)
+
+        self.txt_assess = tk.Text(frame, height=8, font=("Consolas", 11))
+        self.txt_assess.pack(fill=tk.X, padx=10, pady=10)
+
+        cols = ("Rank", "SN", "Deviation Score", "Max |Z|", "Count |Z|>3", "Count |Z|>6", "Failures")
+        self.tree_rank = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            self.tree_rank.heading(c, text=c)
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree_rank.yview)
+        self.tree_rank.configure(yscrollcommand=vsb.set)
+        self.tree_rank.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    def _setup_trend_tab(self):
+        frame = ttk.Frame(self.tab_trend)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ctrl = ttk.Frame(frame, padding=5)
+        ctrl.pack(fill=tk.X)
+        ttk.Label(ctrl, text="Param:").pack(side=tk.LEFT)
+        self.combo_trend_param = ttk.Combobox(ctrl, width=30, state="readonly")
+        self.combo_trend_param.pack(side=tk.LEFT, padx=5)
+        ttk.Button(ctrl, text="Plot", command=self.plot_detailed_trend).pack(side=tk.LEFT)
+        self.trend_plot_frame = ttk.Frame(frame)
+        self.trend_plot_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _setup_report_tab(self):
+        frame = ttk.Frame(self.tab_report)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(frame, text="Generate Screen Report", command=self.generate_screen_report).pack(pady=5)
+        self.report_canvas = tk.Canvas(frame)
+        sb = ttk.Scrollbar(frame, command=self.report_canvas.yview)
+        self.report_frame = ttk.Frame(self.report_canvas)
+        self.report_frame.bind(
+            "<Configure>",
+            lambda e: self.report_canvas.configure(scrollregion=self.report_canvas.bbox("all")),
+        )
+        self.report_canvas.create_window((0, 0), window=self.report_frame, anchor="nw")
+        self.report_canvas.configure(yscrollcommand=sb.set)
+        self.report_canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+    def _setup_visuals_tab(self):
+        frame = ttk.Frame(self.tab_visuals)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill=tk.X)
+
+        ttk.Label(ctrl, text="Param:").pack(side=tk.LEFT)
+        self.combo_param_viz = ttk.Combobox(ctrl, width=30, state="readonly")
+        self.combo_param_viz.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(ctrl, text="X-Axis:").pack(side=tk.LEFT, padx=(15, 2))
+        self.combo_xmode = ttk.Combobox(ctrl, width=8, state="readonly", textvariable=self.var_xmode)
+        self.combo_xmode["values"] = ("Sheet", "SN")
+        self.combo_xmode.current(0)
+        self.combo_xmode.pack(side=tk.LEFT)
+
+        ttk.Label(ctrl, text="Show Limits:").pack(side=tk.LEFT, padx=(15, 2))
+        self.combo_limits = ttk.Combobox(ctrl, width=5, state="readonly", textvariable=self.var_show_limits)
+        self.combo_limits["values"] = ("Off", "On")
+        self.combo_limits.current(0)
+        self.combo_limits.pack(side=tk.LEFT)
+
+        ttk.Button(ctrl, text="Plot Distributions", command=self.plot_distribution).pack(side=tk.LEFT, padx=10)
+
+        self.viz_frame = ttk.Frame(frame)
+        self.viz_frame.pack(fill=tk.BOTH, expand=True)
+
+    # ----------------- Structure detection -----------------
+    def _detect_struct(self, df):
+        col0 = df.iloc[:, 0].astype(str).str.strip()
+        col0_lower = col0.str.lower()
+
+        # Data start
+        start = 18
+        for i in range(len(col0_lower) - 1):
+            if col0_lower.iloc[i] in ["1", "1.0"] and col0_lower.iloc[i + 1] in ["2", "2.0"]:
+                start = i
+                break
+        self.var_data_start.set(start)
+
+        # Data end
+        end = len(df) - 1
+        for i in range(start, len(col0_lower)):
+            if col0_lower.iloc[i] in ["nan", "none", ""]:
+                end = i - 1
+                break
+        self.var_data_end.set(end)
+
+        search_top = max(0, start - 25)
+        search_slice = col0_lower.iloc[search_top:start]
+
+        def find_best_row(patterns_include, patterns_exclude=()):
+            mask = search_slice.apply(
+                lambda s: any(p in s for p in patterns_include) and not any(e in s for e in patterns_exclude)
+            )
+            idx = np.where(mask.to_numpy())[0]
+            if len(idx):
+                return search_top + int(idx[-1])
+            return None
+
+        max_row = find_best_row(
+            ["max limit", "upper limit", "usl"],
+            ["max reading", "maximum reading"],
+        )
+        min_row = find_best_row(
+            ["min limit", "lower limit", "lsl"],
+            ["min reading", "minimum reading"],
+        )
+
+        if max_row is None or min_row is None:
+            u, l = 12, 13
+            for i in range(search_top, start):
+                t = col0_lower.iloc[i]
+                if "max" in t and "reading" not in t:
+                    u = i
+                elif "min" in t and "reading" not in t:
+                    l = i
+            if max_row is None:
+                max_row = u
+            if min_row is None:
+                min_row = l
+
+        self.var_usl_row.set(max_row)
+        self.var_lsl_row.set(min_row)
+        header_row = max(min(max_row, min_row) - 1, 0)
+        self.var_header_row.set(header_row)
+
+    # ----------------- File loading / parsing -----------------
+    def load_file(self):
+        f = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls")])
+        if not f:
+            return
+        self.current_file = f
+        self._load_from_path(f)
+
+    def reload_last_file(self):
+        if not self.current_file or not os.path.isfile(self.current_file):
+            messagebox.showinfo("Info", "No previous file found.")
+            return
+        self._load_from_path(self.current_file)
+
+    def _load_from_path(self, path):
+        self.lbl_status.config(text=f"Loading: {os.path.basename(path)}")
+        self.root.update()
+        try:
+            xls = pd.ExcelFile(path)
+            self.raw_previews = {
+                s: pd.read_excel(xls, sheet_name=s, header=None, engine="openpyxl")
+                for s in xls.sheet_names
+            }
+            if not xls.sheet_names:
+                raise ValueError("Workbook has no sheets.")
+
+            df0 = self.raw_previews[xls.sheet_names[0]]
+            self._detect_struct(df0)
+
+            self.combo_inspect_sheet["values"] = xls.sheet_names
+            if xls.sheet_names:
+                self.combo_inspect_sheet.current(0)
+
+            self.reparse_file()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self.lbl_status.config(text="Error during load.")
+
+    def reparse_file(self):
+        if not self.current_file:
+            return
+        self.page_size = max(10, self.var_page_size.get() or 100)
+
+        h, u, l = self.var_header_row.get(), self.var_usl_row.get(), self.var_lsl_row.get()
+        d_s, d_e = self.var_data_start.get(), self.var_data_end.get()
+        sn_idx = self.var_sn_col.get()
+
+        self.data_dict.clear()
+        self.limits_dict.clear()
+        self.param_map.clear()
+        self.failures.clear()
+        self.measure_long = []
+        self.limit_long = []
+
+        try:
+            for sheet, raw in self.raw_previews.items():
+                if h >= len(raw):
+                    continue
+
+                raw_header = raw.iloc[h].values
+                clean_header = self._process_headers(raw_header)
+
+                usls = pd.to_numeric(raw.iloc[u].values, errors="coerce") if u < len(raw) else []
+                lsls = pd.to_numeric(raw.iloc[l].values, errors="coerce") if l < len(raw) else []
+
+                e = d_e if d_e > d_s else len(raw) - 1
+                e = min(e, len(raw) - 1)
+                df = raw.iloc[d_s : e + 1, :].copy()
+
+                valid = min(len(clean_header), df.shape[1])
+                df = df.iloc[:, :valid]
+
+                col_names = list(clean_header[:valid])
+                if sn_idx < len(col_names):
+                    col_names[sn_idx] = "SN"
+                df.columns = col_names
+
+                df = df.dropna(subset=["SN"], how="all")
+                df["SN"] = df["SN"].astype(str)
+
+                for c in df.columns:
+                    if c != "SN":
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                self.data_dict[sheet] = df
+
+                s_lims = {}
+                for i, p in enumerate(clean_header[:valid]):
+                    if i == sn_idx:
+                        continue
+                    if p not in df.columns:
+                        continue
+
+                    base = self._get_base(p)
+                    if base not in self.param_map:
+                        self.param_map[base] = []
+                    if sheet not in self.param_map[base]:
+                        self.param_map[base].append(sheet)
+
+                    uv = usls[i] if i < len(usls) else np.nan
+                    lv = lsls[i] if i < len(lsls) else np.nan
+                    s_lims[p] = (lv, uv)
+
+                    self.limit_long.append(
+                        {"Sheet": sheet, "Parameter": p, "LSL": lv, "USL": uv}
+                    )
+
+                self.limits_dict[sheet] = s_lims
+
+                value_cols = [c for c in df.columns if c != "SN"]
+                melted = df.melt(id_vars=["SN"], value_vars=value_cols, var_name="Parameter", value_name="Value")
+                melted["Sheet"] = sheet
+                self.measure_long.append(melted)
+
+            if not self.measure_long:
+                self.lbl_status.config(text="No data parsed.")
+                return
+
+            self.measure_long = pd.concat(self.measure_long, ignore_index=True)
+            self.limit_long = pd.DataFrame(self.limit_long).drop_duplicates()
+
+            merged = pd.merge(
+                self.measure_long,
+                self.limit_long,
+                on=["Sheet", "Parameter"],
+                how="left",
+            )
+
+            merged["FailHigh"] = (~merged["USL"].isna()) & (merged["Value"] > merged["USL"])
+            merged["FailLow"]  = (~merged["LSL"].isna()) & (merged["Value"] < merged["LSL"])
+            merged["FailType"] = np.where(
+                merged["FailHigh"], "High",
+                np.where(merged["FailLow"], "Low", "")
+            )
+
+            self.fail_long = merged[(merged["FailHigh"] | merged["FailLow"]) & (~merged["Value"].isna())]
+
+            self.failures = []
+            for _, r in self.fail_long.iterrows():
+                self.failures.append(
+                    {
+                        "Sheet": r["Sheet"],
+                        "SN": r["SN"],
+                        "Parameter": r["Parameter"],
+                        "Value": r["Value"],
+                        "LSL": r["LSL"],
+                        "USL": r["USL"],
+                        "Type": r["FailType"],
+                    }
+                )
+
+            self.combo_trend_param["values"] = sorted(list(self.param_map.keys()))
+            self.combo_param_viz["values"] = self.combo_trend_param["values"]
+
+            self.current_page = 0
+            self.update_inspector_grid(None)
+            self.plot_cpk_viz()
+            self.populate_failures()
+            self.calculate_assessment()
+            self.lbl_status.config(text="Analysis Complete.")
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self.lbl_status.config(text="Error during parse.")
+
+    # ----------------- Inspector pagination -----------------
+    def update_inspector_grid(self, _event):
+        sheet = self.combo_inspect_sheet.get()
+        if sheet not in self.raw_previews:
+            return
+        df = self.raw_previews[sheet]
+        self.total_rows = len(df)
+        self.lbl_page.config(text=f"Page {self.current_page + 1}")
+        self.page_size = max(10, self.var_page_size.get() or 100)
+
+        self.tree_raw.delete(*self.tree_raw.get_children())
+        self.tree_raw["columns"] = list(range(len(df.columns)))
+
+        start = self.current_page * self.page_size
+        subset = df.iloc[start : start + self.page_size]
+
+        w = int(self.var_col_width.get())
+
+        for i in range(len(df.columns)):
+            self.tree_raw.heading(i, text=str(i))
+            # stretch=False ensures manual width is honored
+            self.tree_raw.column(i, width=w, stretch=False, anchor="w")
+
+        h = self.var_header_row.get()
+        u, l = self.var_usl_row.get(), self.var_lsl_row.get()
+        ds, de = self.var_data_start.get(), self.var_data_end.get()
+
+        for i, row in subset.iterrows():
+            vals = [str(x) if not pd.isna(x) else "" for x in row]
+            tag = ""
+            if i == h:
+                tag = "HEADER"
+            elif i == u:
+                tag = "USL"
+            elif i == l:
+                tag = "LSL"
+            elif i == ds:
+                tag = "DATA_START"
+            elif de > 0 and i == de:
+                tag = "DATA_END"
+            self.tree_raw.insert("", "end", values=vals, tags=(tag,))
+
+        self._apply_inspector_row_height()
+        self.tree_raw.update_idletasks()
+
+    def prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_inspector_grid(None)
+
+    def next_page(self):
+        sheet = self.combo_inspect_sheet.get()
+        if sheet in self.raw_previews:
+            total = len(self.raw_previews[sheet])
+            max_page = max(0, (total - 1) // self.page_size)
+            if self.current_page < max_page:
+                self.current_page += 1
+                self.update_inspector_grid(None)
+
+    def goto_page(self):
+        sheet = self.combo_inspect_sheet.get()
+        if sheet not in self.raw_previews:
+            return
+        total = len(self.raw_previews[sheet])
+        max_page = max(0, (total - 1) // self.page_size)
+        p = max(0, min(max_page, self.var_goto_page.get() - 1))
+        self.current_page = p
+        self.update_inspector_grid(None)
+
+    def on_sheet_change(self, _event):
+        self.current_page = 0
+        self.update_inspector_grid(None)
+
+    # ----------------- Cpk plotting -----------------
+    def plot_cpk_viz(self):
+        data = []
+        for s, df in self.data_dict.items():
+            for c in df.columns:
+                if c == "SN":
+                    continue
+                v = df[c].dropna()
+                l, u = self.limits_dict[s].get(c, (np.nan, np.nan))
+                cpk = self._calc_cpk(v, l, u)
+                if not pd.isna(cpk):
+                    data.append({"Param": c, "Cpk": cpk, "Mean": v.mean()})
+        if not data:
+            return
+
+        df_p = pd.DataFrame(data)
+
+        self.tree_cpk.delete(*self.tree_cpk.get_children())
+        for _, r in df_p.sort_values("Cpk").iterrows():
+            self.tree_cpk.insert(
+                "",
+                "end",
+                values=(r["Param"], f"{r['Cpk']:.3f}", f"{r['Mean']:.3f}"),
+            )
+
+        if self.cpk_canvas is None:
+            self.cpk_fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
+            self.cpk_canvas = FigureCanvasTkAgg(self.cpk_fig, master=self.cpk_plot_frame)
+            self.cpk_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        else:
+            self.cpk_fig.clf()
+            ax1, ax2 = self.cpk_fig.subplots(1, 2)
+
+        ax1.hist(df_p["Cpk"], bins=20, color="steelblue", edgecolor="black")
+        ax1.axvline(1.33, color="green", linestyle="--", label="1.33")
+        ax1.axvline(1.67, color="orange", linestyle="--", label="1.67")
+        ax1.set_xlabel("Cpk")
+        ax1.set_ylabel("Count")
+        ax1.set_title("Cpk Distribution")
+        ax1.legend()
+
+        worst = df_p.sort_values("Cpk").head(20)
+        ax2.barh(worst["Param"], worst["Cpk"], color="crimson")
+        ax2.axvline(1.33, color="black", ls="--")
+        ax2.set_xlabel("Cpk")
+        ax2.set_title("20 Lowest Cpk Parameters")
+        ax2.invert_yaxis()
+
+        self.cpk_canvas.draw()
+
+    # ----------------- Detailed Trend (no 3σ shading) -----------------
+    def plot_detailed_trend(self):
+        param = self.combo_trend_param.get()
+        if not param:
+            return
+
+        if self.trend_canvas is None:
+            self.trend_fig, ax = plt.subplots(figsize=(10, 6))
+            self.trend_canvas = FigureCanvasTkAgg(self.trend_fig, master=self.trend_plot_frame)
+            self.trend_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        else:
+            self.trend_fig.clf()
+            ax = self.trend_fig.subplots(1, 1)
+
+        ax2 = ax.twinx()
+
+        sheets = self.param_map.get(param, [])
+        mean_colors = {"Room": "green", "Cold": "blue", "Hot": "red", "Data": "black"}
+        cpk_styles = {
+            "Room": ("green", ":", "o"),
+            "Cold": ("blue", "-.", "D"),
+            "Hot": ("red", "--", "s"),
+            "Data": ("purple", ":", "X"),
+        }
+
+        temps = ["Room", "Cold", "Hot"] if self.is_tritemp else ["Data"]
+        x_labels = []
+        mean_series = {t: [] for t in temps}
+        cpk_series = {t: [] for t in temps}
+
+        for s in sheets:
+            x_labels.append(s)
+            for t in temps:
+                suf = f" ({t})" if self.is_tritemp else ""
+                col = f"{param}{suf}"
+                if col in self.data_dict[s].columns:
+                    v = self.data_dict[s][col].dropna()
+                    if not v.empty:
+                        mean_series[t].append(v.mean())
+                        l, u = self.limits_dict[s].get(col, (np.nan, np.nan))
+                        cpk_val = self._calc_cpk(v, l, u)
+                        cpk_series[t].append(cpk_val)
+                    else:
+                        mean_series[t].append(np.nan)
+                        cpk_series[t].append(np.nan)
+                else:
+                    mean_series[t].append(np.nan)
+                    cpk_series[t].append(np.nan)
+
+        mean_handles = []
+        cpk_handles = []
+        for t in temps:
+            ys_m = mean_series[t]
+            if any(not pd.isna(x) for x in ys_m):
+                c = mean_colors.get(t, "black")
+                label = f"{t} Mean" if self.is_tritemp else "Mean"
+                h = ax.plot(x_labels, ys_m, marker="o", linestyle="-", label=label, color=c)[0]
+                mean_handles.append(h)
+
+        for t in temps:
+            ys_c = cpk_series[t]
+            if any(not pd.isna(x) for x in ys_c):
+                c, ls, mk = cpk_styles.get(t, ("purple", ":", "X"))
+                label = f"{t} Cpk" if self.is_tritemp else "Cpk"
+                h = ax2.plot(x_labels, ys_c, marker=mk, linestyle=ls, linewidth=2.0, label=label, color=c)[0]
+                cpk_handles.append(h)
+
+        ax2.axhline(1.33, color="gray", linestyle=":", label="1.33")
+        ax.set_xlabel("Sheet / Lot")
+        ax.set_ylabel(f"{param} Mean")
+        ax.set_title(f"Detailed Trend: {param}")
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax2.set_ylabel("Cpk")
+
+        handles = mean_handles + cpk_handles
+        labels = [h.get_label() for h in handles]
+        ax.legend(handles, labels, loc="upper left")
+
+        self.trend_canvas.draw()
+
+    # ----------------- Distributions tab -----------------
+    def plot_distribution(self):
+        param = self.combo_param_viz.get()
+        if not param or self.measure_long is None:
+            return
+
+        xmode = self.var_xmode.get()
+        show_limits = self.var_show_limits.get() == "On"
+
+        base_param = param
+        sub = self.measure_long[self.measure_long["Parameter"].apply(lambda p: self._get_base(p) == base_param)]
+        if sub.empty:
+            messagebox.showinfo("Info", f"No numeric data found for {param}")
+            return
+
+        limits_sub = self.limit_long[self.limit_long["Parameter"].isin(sub["Parameter"].unique())]
+        dist_df = pd.merge(sub, limits_sub, on=["Sheet", "Parameter"], how="left")
+
+        if self.viz_canvas is None:
+            self.viz_fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            self.viz_canvas = FigureCanvasTkAgg(self.viz_fig, master=self.viz_frame)
+            self.viz_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        else:
+            self.viz_fig.clf()
+            ax1, ax2 = self.viz_fig.subplots(1, 2)
+
+        def temp_of(p):
+            for t in ["Room", "Cold", "Hot"]:
+                if f"({t})" in p:
+                    return t
+            return "Data"
+
+        dist_df["Temp"] = dist_df["Parameter"].apply(temp_of)
+
+        if self.is_tritemp:
+            sns.histplot(
+                data=dist_df,
+                x="Value",
+                hue="Temp",
+                kde=True,
+                ax=ax1,
+                palette={"Room": "green", "Cold": "blue", "Hot": "red"},
+                multiple="layer",
+                alpha=0.5,
+            )
+            ax1.set_title(f"{base_param} Distribution by Temperature")
+        else:
+            sns.histplot(dist_df["Value"], kde=True, ax=ax1, color="steelblue", edgecolor="black")
+            ax1.set_title(f"{base_param} Overall Distribution")
+
+        if show_limits:
+            if self.is_tritemp:
+                for t, c in [("Room", "green"), ("Cold", "blue"), ("Hot", "red")]:
+                    tmp = dist_df[dist_df["Temp"] == t]
+                    if not tmp.empty:
+                        l_vals = tmp["LSL"].dropna().unique()
+                        u_vals = tmp["USL"].dropna().unique()
+                        if l_vals.size:
+                            ax1.axvline(l_vals[0], color=c, linestyle="--", alpha=0.7)
+                        if u_vals.size:
+                            ax1.axvline(u_vals[0], color=c, linestyle="--", alpha=0.7)
+            else:
+                l_vals = dist_df["LSL"].dropna().unique()
+                u_vals = dist_df["USL"].dropna().unique()
+                if l_vals.size:
+                    ax1.axvline(l_vals[0], color="black", linestyle="--", alpha=0.7)
+                if u_vals.size:
+                    ax1.axvline(u_vals[0], color="black", linestyle="--", alpha=0.7)
+
+        if xmode == "Sheet":
+            x_col = "Sheet"
+            ax2.set_title(f"{base_param} by Sheet / Lot")
+        else:
+            x_col = "SN"
+            ax2.set_title(f"{base_param} by Serial Number")
+
+        dist_plot = dist_df.copy()
+        if xmode == "SN":
+            counts = dist_plot["SN"].value_counts().head(50).index
+            dist_plot = dist_plot[dist_plot["SN"].isin(counts)]
+
+        if self.is_tritemp:
+            sns.boxplot(
+                data=dist_plot,
+                x=x_col,
+                y="Value",
+                hue="Temp",
+                ax=ax2,
+                palette={"Room": "green", "Cold": "blue", "Hot": "red"},
+            )
+            ax2.legend(title="Temp", fontsize=8)
+        else:
+            sns.boxplot(data=dist_plot, x=x_col, y="Value", ax=ax2, color="lightgray")
+
+        ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha="right")
+
+        if show_limits:
+            if self.is_tritemp:
+                for t, c in [("Room", "green"), ("Cold", "blue"), ("Hot", "red")]:
+                    tmp = dist_plot[dist_plot["Temp"] == t]
+                    if not tmp.empty:
+                        l_vals = tmp["LSL"].dropna().unique()
+                        u_vals = tmp["USL"].dropna().unique()
+                        if l_vals.size:
+                            ax2.axhline(l_vals[0], color=c, linestyle="--", alpha=0.7)
+                        if u_vals.size:
+                            ax2.axhline(u_vals[0], color=c, linestyle="--", alpha=0.7)
+            else:
+                l_vals = dist_plot["LSL"].dropna().unique()
+                u_vals = dist_plot["USL"].dropna().unique()
+                if l_vals.size:
+                    ax2.axhline(l_vals[0], color="black", linestyle="--", alpha=0.7)
+                if u_vals.size:
+                    ax2.axhline(u_vals[0], color="black", linestyle="--", alpha=0.7)
+
+        self.viz_canvas.draw()
+
+    # ----------------- Failures and assessment -----------------
+    def populate_failures(self):
+        self.tree_fail.delete(*self.tree_fail.get_children())
+        for f in self.failures:
+            self.tree_fail.insert(
+                "",
+                "end",
+                values=(f["Sheet"], f["SN"], f["Parameter"], f["Value"], f["LSL"], f["USL"], f["Type"]),
+            )
+        self.lbl_fail_summary.config(text=f"Total Failures Detected: {len(self.failures)}")
+
+    def calculate_assessment(self):
+        all_z = []
+        for s, df in self.data_dict.items():
+            cols = [c for c in df.columns if c != "SN"]
+            num = df[cols].select_dtypes(include=[np.number])
+            if "SN" in df.columns and not num.empty:
+                num = num.copy()
+                num.index = df["SN"].astype(str)
+                z = (num - num.mean()) / num.std()
+                all_z.append(z)
+
+        if not all_z:
+            return
+
+        full_z = pd.concat(all_z, axis=1).fillna(0)
+        abs_z = full_z.abs()
+        scores = abs_z.sum(axis=1)
+        max_z = abs_z.max(axis=1)
+        cnt_z3 = (abs_z > 3).sum(axis=1)
+        cnt_z6 = (abs_z > 6).sum(axis=1)
+
+        rank_df = pd.DataFrame({
+            "Score": scores,
+            "MaxZ": max_z,
+            "Count3": cnt_z3,
+            "Count6": cnt_z6,
+        }).sort_values("Score")
+
+        best = rank_df.head(5).index.tolist()
+        worst = rank_df.tail(5).index.tolist()[::-1]
+
+        txt = "LOT ASSESSMENT REPORT\n" + "=" * 30 + "\n"
+        txt += f"Best Performers (lowest overall |z|): {', '.join(map(str, best))}\n"
+        txt += f"Worst Performers (highest overall |z|): {', '.join(map(str, worst))}\n"
+        txt += "\nStrong outliers (Max |z| > 6):\n"
+        strong = rank_df[rank_df["MaxZ"] > 6]
+        if strong.empty:
+            txt += "  None detected.\n"
+        else:
+            for sn, row in strong.sort_values("MaxZ", ascending=False).iterrows():
+                txt += f"  SN {sn}: MaxZ={row['MaxZ']:.2f}, Count>|6|={int(row['Count6'])}\n"
+
+        self.txt_assess.delete("1.0", tk.END)
+        self.txt_assess.insert(tk.END, txt)
+
+        self.tree_rank.delete(*self.tree_rank.get_children())
+        rank_desc = rank_df.sort_values("Score", ascending=False)
+        fail_counts = pd.DataFrame(self.failures)["SN"].value_counts() if self.failures else pd.Series(dtype=int)
+        for i, (sn, row) in enumerate(rank_desc.iterrows(), start=1):
+            self.tree_rank.insert(
+                "",
+                "end",
+                values=(
+                    i,
+                    sn,
+                    f"{row['Score']:.2f}",
+                    f"{row['MaxZ']:.2f}",
+                    int(row["Count3"]),
+                    int(row["Count6"]),
+                    fail_counts.get(sn, 0),
+                ),
+            )
+
+    # ----------------- Report / export -----------------
+    def generate_screen_report(self):
+        for w in self.report_frame.winfo_children():
+            w.destroy()
+
+        ttk.Label(self.report_frame, text="Screen Report", font=("Arial", 14, "bold")).pack(anchor="w", pady=5)
+
+        summary = tk.Text(self.report_frame, height=8, font=("Consolas", 10))
+        summary.pack(fill=tk.X, padx=5, pady=5)
+
+        total_sn = set()
+        for df in self.data_dict.values():
+            if "SN" in df.columns:
+                total_sn.update(df["SN"].dropna().astype(str).tolist())
+
+        summary.insert(
+            tk.END,
+            f"Total lots/devices (unique SN): {len(total_sn)}\n"
+            f"Total failures: {len(self.failures)}\n"
+            f"Total parameters with limits: {len(self.param_map)}\n",
+        )
+
+        cols = ("Parameter", "Count", "Mean", "Std", "Min", "Max")
+        tree_stats = ttk.Treeview(self.report_frame, columns=cols, show="headings", height=15)
+        for c in cols:
+            tree_stats.heading(c, text=c)
+            tree_stats.column(c, anchor="w", width=120)
+        tree_stats.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        stats = {}
+        for s, df in self.data_dict.items():
+            for c in df.columns:
+                if c == "SN":
+                    continue
+                base = self._get_base(c)
+                vals = df[c].dropna()
+                if vals.empty:
+                    continue
+                if base not in stats:
+                    stats[base] = []
+                stats[base].append(vals)
+
+        for p, vlist in stats.items():
+            allv = pd.concat(vlist)
+            tree_stats.insert(
+                "",
+                "end",
+                values=(
+                    p,
+                    int(allv.count()),
+                    f"{allv.mean():.3f}",
+                    f"{allv.std():.3f}",
+                    f"{allv.min():.3f}",
+                    f"{allv.max():.3f}",
+                ),
+            )
+
+    def export_failures_csv(self):
+        if not self.failures:
+            messagebox.showinfo("Info", "No failures to export.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        pd.DataFrame(self.failures).to_csv(path, index=False)
+        messagebox.showinfo("Export", f"Failures exported to {path}")
+
+    def export_assessment_csv(self):
+        if not self.data_dict:
+            messagebox.showinfo("Info", "No data loaded.")
+            return
+        all_z = []
+        for s, df in self.data_dict.items():
+            cols = [c for c in df.columns if c != "SN"]
+            num = df[cols].select_dtypes(include=[np.number])
+            if "SN" in df.columns and not num.empty:
+                num = num.copy()
+                num.index = df["SN"].astype(str)
+                z = (num - num.mean()) / num.std()
+                all_z.append(z)
+        if not all_z:
+            messagebox.showinfo("Info", "No numeric data for assessment.")
+            return
+        full_z = pd.concat(all_z, axis=1).fillna(0)
+        abs_z = full_z.abs()
+        scores = abs_z.sum(axis=1)
+        max_z = abs_z.max(axis=1)
+        cnt_z3 = (abs_z > 3).sum(axis=1)
+        cnt_z6 = (abs_z > 6).sum(axis=1)
+
+        rank = pd.DataFrame({
+            "SN": scores.index,
+            "DeviationScore": scores.values,
+            "MaxZ": max_z.values,
+            "Count|Z|>3": cnt_z3.values,
+            "Count|Z|>6": cnt_z6.values,
+        }).sort_values("DeviationScore")
+
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        rank.to_csv(path, index=False)
+        messagebox.showinfo("Export", f"Assessment exported to {path}")
+
+    # ----------------- Helpers -----------------
+    def _process_headers(self, raw):
+        clean = [str(h).strip() for h in raw if str(h).lower() != "nan"]
+        if len(clean) > 5:
+            b = len(clean) // 3
+            if b > 0:
+                s1, s2 = set(clean[:b]), set(clean[b : 2 * b])
+                if b > 0 and len(s1 & s2) / b > 0.7:
+                    self.is_tritemp = True
+                    new_h = []
+                    for i, h in enumerate(raw):
+                        s = str(h).strip()
+                        if i <= self.var_sn_col.get() + 1:
+                            new_h.append(s)
+                        else:
+                            adj = i - (self.var_sn_col.get() + 2)
+                            sub = max(1, (len(raw) - 2) // 3)
+                            if adj < sub:
+                                t = "(Room)"
+                            elif adj < 2 * sub:
+                                t = "(Cold)"
+                            else:
+                                t = "(Hot)"
+                            new_h.append(f"{s} {t}")
+                    return self._unique(new_h)
+        return self._unique(raw)
+
+    def _unique(self, headers):
+        seen, out = {}, []
+        for x in headers:
+            s = str(x).strip()
+            seen[s] = seen.get(s, -1) + 1
+            out.append(f"{s}.{seen[s]}" if seen[s] > 0 else s)
+        return out
+
+    def _get_base(self, p):
+        for t in ["(Room)", "(Cold)", "(Hot)"]:
+            p = p.replace(t, "").strip()
+        return p
+
+    def _calc_cpk(self, v, l, u):
+        if v.empty or v.std() == 0:
+            return np.nan
+        m, s = v.mean(), v.std()
+        cpu = (u - m) / (3 * s) if not pd.isna(u) else np.nan
+        cpl = (m - l) / (3 * s) if not pd.isna(l) else np.nan
+        if pd.isna(cpu) and pd.isna(cpl):
+            return np.nan
+        if pd.isna(cpu):
+            return cpl
+        if pd.isna(cpl):
+            return cpu
+        return min(cpu, cpl)
+
+    def _sort_cpk_tree(self, col, reverse):
+        data = [(self.tree_cpk.set(k, col), k) for k in self.tree_cpk.get_children("")]
+        if col in ("Cpk", "Mean"):
+            data.sort(key=lambda t: float(t[0]), reverse=reverse)
+        else:
+            data.sort(key=lambda t: t[0], reverse=reverse)
+        for idx, (_, k) in enumerate(data):
+            self.tree_cpk.move(k, "", idx)
+        self.tree_cpk.heading(col, command=lambda: self._sort_cpk_tree(col, not reverse))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = QualAnalyzerV20(root)
+    root.mainloop()
