@@ -7,6 +7,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import os
+from scipy import stats
 
 # Plot style
 sns.set_theme(style="whitegrid")
@@ -33,7 +34,7 @@ class QualAnalyzerV20:
         self.fail_long = None      # DataFrame: full failure table
 
         # Config Vars
-        self.var_header_row = tk.IntVar(value=8)
+        self.var_header_row = tk.IntVar(value=5)
         self.var_usl_row = tk.IntVar(value=12)
         self.var_lsl_row = tk.IntVar(value=13)
         self.var_data_start = tk.IntVar(value=18)
@@ -41,7 +42,7 @@ class QualAnalyzerV20:
         self.var_sn_col = tk.IntVar(value=0)
 
         # Inspector sizing controls
-        self.var_col_width = tk.IntVar(value=500)   # px
+        self.var_col_width = tk.IntVar(value=50)   # px
         self.var_row_height = tk.IntVar(value=22)   # px
 
         # Pagination
@@ -133,7 +134,7 @@ class QualAnalyzerV20:
             ttk.Label(f, text=lbl, width=18).pack(side=tk.LEFT)
             ttk.Entry(f, textvariable=var, width=8).pack(side=tk.RIGHT)
 
-        entry("Header Row:", self.var_header_row)
+        entry("Parameter (Row):", self.var_header_row)
         entry("Max Limit (Row):", self.var_usl_row)
         entry("Min Limit (Row):", self.var_lsl_row)
         entry("Data Start (Row):", self.var_data_start)
@@ -236,6 +237,25 @@ class QualAnalyzerV20:
     def _setup_cpk_tab(self):
         frame = ttk.Frame(self.tab_cpk)
         frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- NEW: Control Bar for Interactivity ---
+        ctrl_frame = ttk.Frame(frame, padding=5)
+        ctrl_frame.pack(fill=tk.X)
+
+        ttk.Label(ctrl_frame, text="Visualization Mode:").pack(side=tk.LEFT)
+
+        self.var_cpk_viz_mode = tk.StringVar(value="Histogram (Distribution)")
+        self.combo_cpk_mode = ttk.Combobox(ctrl_frame, textvariable=self.var_cpk_viz_mode, state="readonly", width=35)
+        self.combo_cpk_mode['values'] = (
+            "Histogram (Distribution)",
+            "Box Plot (Compare Test Steps)",
+            "Bubble Plot (Identify Outliers)",
+            "Centering Analysis (Precision vs Accuracy)"
+        )
+        self.combo_cpk_mode.pack(side=tk.LEFT, padx=5)
+        self.combo_cpk_mode.bind("<<ComboboxSelected>>", lambda e: self.plot_cpk_viz())
+        # ------------------------------------------
+
         paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
@@ -293,12 +313,38 @@ class QualAnalyzerV20:
     def _setup_trend_tab(self):
         frame = ttk.Frame(self.tab_trend)
         frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- Control Bar ---
         ctrl = ttk.Frame(frame, padding=5)
         ctrl.pack(fill=tk.X)
-        ttk.Label(ctrl, text="Param:").pack(side=tk.LEFT)
-        self.combo_trend_param = ttk.Combobox(ctrl, width=30, state="readonly")
+
+        # Parameter Selection
+        ttk.Label(ctrl, text="Parameter:").pack(side=tk.LEFT)
+        self.combo_trend_param = ttk.Combobox(ctrl, width=25, state="readonly")
         self.combo_trend_param.pack(side=tk.LEFT, padx=5)
-        ttk.Button(ctrl, text="Plot", command=self.plot_detailed_trend).pack(side=tk.LEFT)
+
+        # [NEW] Auto-trigger plot when parameter changes
+        self.combo_trend_param.bind("<<ComboboxSelected>>", lambda e: self.plot_detailed_trend())
+
+        # Analysis Type Selection
+        ttk.Label(ctrl, text="Analysis Type:").pack(side=tk.LEFT, padx=(15, 2))
+        self.var_trend_type = tk.StringVar(value="Mean & Cpk Trend")
+        self.combo_trend_type = ttk.Combobox(ctrl, textvariable=self.var_trend_type, state="readonly", width=30)
+        self.combo_trend_type["values"] = (
+            "Mean & Cpk Trend",
+            "Box Plot Series (Spread)",
+            "Spaghetti Plot (Individual Tracks)",
+            "Drift / Delta Analysis (vs T0)"
+        )
+        self.combo_trend_type.pack(side=tk.LEFT, padx=5)
+        self.combo_trend_type.current(0)
+
+        # [NEW] Auto-trigger plot when graph type changes
+        self.combo_trend_type.bind("<<ComboboxSelected>>", lambda e: self.plot_detailed_trend())
+
+        # Keep the button as a backup
+        ttk.Button(ctrl, text="Refresh Plot", command=self.plot_detailed_trend).pack(side=tk.LEFT, padx=15)
+
         self.trend_plot_frame = ttk.Frame(frame)
         self.trend_plot_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -645,133 +691,363 @@ class QualAnalyzerV20:
 
     # ----------------- Cpk plotting -----------------
     def plot_cpk_viz(self):
+        # 1. Gather Data
         data = []
         for s, df in self.data_dict.items():
             for c in df.columns:
-                if c == "SN":
-                    continue
+                if c == "SN": continue
                 v = df[c].dropna()
                 l, u = self.limits_dict[s].get(c, (np.nan, np.nan))
-                cpk = self._calc_cpk(v, l, u)
+                cpk = self._calc_robust_cpk(v, l, u)
+
                 if not pd.isna(cpk):
-                    data.append({"Param": c, "Cpk": cpk, "Mean": v.mean()})
-        if not data:
-            return
+                    # Calculate "Centering" (0.0 = LSL, 1.0 = USL, 0.5 = Perfect Center)
+                    centering = np.nan
+                    if not pd.isna(l) and not pd.isna(u) and (u != l):
+                        mean_val = v.mean()
+                        centering = (mean_val - l) / (u - l)
 
+                    data.append({
+                        "Sheet": s,
+                        "Param": c,
+                        "Cpk": cpk,
+                        "Mean": v.mean(),
+                        "Centering": centering
+                    })
+
+        if not data: return
         df_p = pd.DataFrame(data)
+        df_p = df_p.replace([np.inf, -np.inf], np.nan).dropna(subset=["Cpk"])
+        if df_p.empty: return
 
+        # 2. Update Treeview (Standard for all views)
         self.tree_cpk.delete(*self.tree_cpk.get_children())
         for _, r in df_p.sort_values("Cpk").iterrows():
-            self.tree_cpk.insert(
-                "",
-                "end",
-                values=(r["Param"], f"{r['Cpk']:.3f}", f"{r['Mean']:.3f}"),
-            )
+            lbl = f"{r['Sheet']}:{r['Param']}"
+            self.tree_cpk.insert("", "end", values=(lbl, f"{r['Cpk']:.3f}", f"{r['Mean']:.3f}"))
 
+        # 3. Handle Canvas
         if self.cpk_canvas is None:
-            self.cpk_fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
+            self.cpk_fig = plt.Figure(figsize=(12, 6), dpi=100)  # Use Figure, not subplots, for easier clearing
             self.cpk_canvas = FigureCanvasTkAgg(self.cpk_fig, master=self.cpk_plot_frame)
             self.cpk_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         else:
             self.cpk_fig.clf()
-            ax1, ax2 = self.cpk_fig.subplots(1, 2)
 
-        ax1.hist(df_p["Cpk"], bins=20, color="steelblue", edgecolor="black")
-        ax1.axvline(1.33, color="green", linestyle="--", label="1.33")
-        ax1.axvline(1.67, color="orange", linestyle="--", label="1.67")
-        ax1.set_xlabel("Cpk")
-        ax1.set_ylabel("Count")
-        ax1.set_title("Cpk Distribution")
-        ax1.legend()
+        # 4. Dispatch Plot Type
+        mode = self.var_cpk_viz_mode.get()
+        ax = self.cpk_fig.add_subplot(111)
 
-        worst = df_p.sort_values("Cpk").head(20)
-        ax2.barh(worst["Param"], worst["Cpk"], color="crimson")
-        ax2.axvline(1.33, color="black", ls="--")
-        ax2.set_xlabel("Cpk")
-        ax2.set_title("20 Lowest Cpk Parameters")
-        ax2.invert_yaxis()
+        # --- MODE A: Histogram (Classic) ---
+        if "Histogram" in mode:
+            viz_max = 4.0
+            clipped = df_p["Cpk"].clip(upper=viz_max)
+            ax.hist(clipped, bins=25, range=(0, viz_max), color="#4C72B0", edgecolor="white")
+            ax.axvline(1.33, color="orange", ls="--", label="1.33 Limit")
+            ax.axvline(1.67, color="green", ls="--", label="1.67 Limit")
+            ax.set_title("Overall Cpk Distribution", fontsize=12, fontweight='bold')
+            ax.set_xlabel(f"Cpk (Capped at {viz_max})")
+            ax.legend()
 
+        # --- MODE B: Box Plot (Compare Test Steps) ---
+        elif "Box Plot" in mode:
+            # FIX 1: Clip extreme values at 10.0 instead of letting the plot cut them off.
+            # Cpk > 10 is statistically "Infinity" for a Qual.
+            # This ensures even "perfect" parameters are visible at the top of the chart.
+            plot_data = df_p.copy()
+            plot_data["Cpk"] = plot_data["Cpk"].clip(upper=10.0)
+
+            # Create the box plot using this "safe" data
+            sns.boxplot(data=plot_data, x="Sheet", y="Cpk", ax=ax, palette="vlag")
+            sns.stripplot(data=plot_data, x="Sheet", y="Cpk", ax=ax, color="black", alpha=0.3, jitter=True, size=3)
+
+            # Add the limit line
+            ax.axhline(1.33, color="red", ls="--", alpha=0.5, label="1.33 Limit")
+
+            # FIX 2: Remove the hard "5" limit.
+            # Instead, set the top to slightly above the highest value in the data (max 10).
+            # This "Auto-fits" the chart to your actual data height.
+            current_max = plot_data["Cpk"].max()
+            ax.set_ylim(0, current_max * 1.1)
+
+            ax.set_title("Process Capability by Electrical Test Step", fontsize=12, fontweight='bold')
+            ax.set_xlabel("Test Step / Sheet")
+
+        # --- MODE C: Bubble Plot (Outlier Spotter) ---
+        elif "Bubble" in mode:
+            # X = Sheet (Categorical mapped to Int), Y = Cpk
+            sheets = sorted(df_p["Sheet"].unique())
+            sheet_map = {name: i for i, name in enumerate(sheets)}
+            df_p["SheetIdx"] = df_p["Sheet"].map(sheet_map)
+
+            # Size: Inverse of Cpk (Smaller Cpk = Bigger Risk Bubble)
+            # We clip the denominator so Cpk=0 doesn't cause div/0 or infinite size
+            # We also cap the Cpk used for sizing at 3.0, so "Good" points (Cpk>3) represent minimum risk size
+            size_cpk = df_p["Cpk"].clip(lower=0.1, upper=3.0)
+            sizes = (1.0 / size_cpk) * 250
+
+            # Color map: Red (Bad) to Green (Good)
+            # We clip color data at 2.0 so super-high Cpk doesn't skew the color scale
+            color_data = df_p["Cpk"].clip(upper=2.0)
+
+            sc = ax.scatter(
+                df_p["SheetIdx"],
+                df_p["Cpk"],
+                s=sizes,
+                c=color_data,
+                cmap="RdYlGn",
+                alpha=0.6,
+                edgecolors="black",
+                linewidth=0.5
+            )
+
+            # --- THE FIX: SYMLOG SCALE ---
+            # 'linthresh=3' means: Be Linear from 0 to 3. Be Logarithmic above 3.
+            # This keeps your 0-2 range perfectly readable while shrinking the 10,000 outlier.
+            ax.set_yscale('symlog', linthresh=3)
+
+            # Force specific y-ticks so the linear part is readable
+            # We want to see 0, 1, 1.33, 2, 3 clearly.
+            # Then powers of 10 for the outliers.
+            from matplotlib.ticker import FixedLocator, ScalarFormatter
+
+            # Combine standard linear ticks with log ticks
+            major_ticks = [0, 1, 1.33, 2, 3, 10, 100, 1000, 10000]
+            # Filter ticks to only those within actual data range (plus a buffer)
+            max_val = df_p["Cpk"].max()
+            visible_ticks = [t for t in major_ticks if t <= max_val * 10]
+
+            ax.yaxis.set_major_locator(FixedLocator(visible_ticks))
+            ax.yaxis.set_major_formatter(ScalarFormatter())  # Formatting numbers as 10, 100 (not 10^2)
+
+            ax.set_xticks(range(len(sheets)))
+            ax.set_xticklabels(sheets, rotation=45, ha="right")
+            ax.set_title("Cpk Outlier Detection (Symlog Scale)", fontsize=12, fontweight='bold')
+            ax.set_ylabel("Cpk Value (Linear ≤ 3, Log > 3)")
+
+            # Add grid for both major (labeled) and minor ticks
+            ax.grid(True, which='major', linestyle="-", alpha=0.5)
+            ax.grid(True, which='minor', linestyle=":", alpha=0.2)
+
+            # Add colorbar
+            plt.colorbar(sc, ax=ax, label="Cpk (Color capped at 2.0)")
+
+        # --- MODE D: Centering Analysis (The Engineer's Favorite) ---
+        elif "Centering" in mode:
+            # Filter for items that actually have limits (Centering != NaN)
+            valid = df_p.dropna(subset=["Centering"])
+            if valid.empty:
+                ax.text(0.5, 0.5, "No parameters with both LSL & USL found", ha='center')
+            else:
+                sc = ax.scatter(
+                    valid["Centering"],
+                    valid["Cpk"],
+                    c=valid["Cpk"],
+                    cmap="RdYlGn",
+                    edgecolors="grey",
+                    alpha=0.7
+                )
+
+                # Draw "Goal Posts"
+                ax.axvline(0.0, color="red", ls="-", label="LSL")
+                ax.axvline(1.0, color="red", ls="-", label="USL")
+                ax.axvline(0.5, color="grey", ls=":", label="Target")
+
+                ax.set_xlim(-0.2, 1.2)
+                ax.set_ylim(0, 4)
+                ax.set_title("Centering Analysis: Are failures due to Noise or Drift?", fontsize=12, fontweight='bold')
+                ax.set_xlabel("Mean Position (0=LSL, 0.5=Center, 1=USL)")
+                ax.set_ylabel("Cpk (Precision)")
+                ax.legend(loc='upper right')
+
+        self.cpk_fig.tight_layout()
         self.cpk_canvas.draw()
 
     # ----------------- Detailed Trend (no 3σ shading) -----------------
     def plot_detailed_trend(self):
-        param = self.combo_trend_param.get()
-        if not param:
-            return
+        try:
+            param = self.combo_trend_param.get()
+            plot_type = self.var_trend_type.get()
 
-        if self.trend_canvas is None:
-            self.trend_fig, ax = plt.subplots(figsize=(10, 6))
-            self.trend_canvas = FigureCanvasTkAgg(self.trend_fig, master=self.trend_plot_frame)
-            self.trend_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        else:
-            self.trend_fig.clf()
-            ax = self.trend_fig.subplots(1, 1)
+            # 1. Clear previous plot immediately to prevent "stale" data confusion
+            if self.trend_canvas is None:
+                self.trend_fig = plt.Figure(figsize=(10, 6), dpi=100)
+                self.trend_canvas = FigureCanvasTkAgg(self.trend_fig, master=self.trend_plot_frame)
+                self.trend_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            else:
+                self.trend_fig.clf()
 
-        ax2 = ax.twinx()
+            # Force a draw now so if we return early, the user sees a blank screen (not the old plot)
+            self.trend_canvas.draw()
 
-        sheets = self.param_map.get(param, [])
-        mean_colors = {"Room": "green", "Cold": "blue", "Hot": "red", "Data": "black"}
-        cpk_styles = {
-            "Room": ("green", ":", "o"),
-            "Cold": ("blue", "-.", "D"),
-            "Hot": ("red", "--", "s"),
-            "Data": ("purple", ":", "X"),
-        }
+            if not param or self.measure_long is None:
+                return
 
-        temps = ["Room", "Cold", "Hot"] if self.is_tritemp else ["Data"]
-        x_labels = []
-        mean_series = {t: [] for t in temps}
-        cpk_series = {t: [] for t in temps}
+            # 2. Global Definition of sheet_order (CRITICAL FIX)
+            # This must exist before any if/else blocks try to use it
+            sheet_order = list(self.data_dict.keys())
 
-        for s in sheets:
-            x_labels.append(s)
-            for t in temps:
-                suf = f" ({t})" if self.is_tritemp else ""
-                col = f"{param}{suf}"
-                if col in self.data_dict[s].columns:
-                    v = self.data_dict[s][col].dropna()
-                    if not v.empty:
-                        mean_series[t].append(v.mean())
-                        l, u = self.limits_dict[s].get(col, (np.nan, np.nan))
-                        cpk_val = self._calc_cpk(v, l, u)
-                        cpk_series[t].append(cpk_val)
-                    else:
-                        mean_series[t].append(np.nan)
-                        cpk_series[t].append(np.nan)
+            # 3. Create the Base Subset (for Box/Spaghetti plots)
+            # We filter by the base parameter name to capture all temps
+            subset = self.measure_long[
+                self.measure_long["Parameter"].apply(lambda x: self._get_base(x) == param)].copy()
+
+            if subset.empty:
+                # If no data found, just exit (screen is already cleared)
+                return
+
+            # Sort subset by Sheet order
+            subset["Sheet"] = subset["Sheet"].astype(str)
+            subset["Sheet"] = pd.Categorical(subset["Sheet"], categories=sheet_order, ordered=True)
+            subset = subset.sort_values("Sheet")
+
+            ax = self.trend_fig.add_subplot(111)
+
+            # =========================================================
+            # MODE 1: Mean & Cpk Trend (Tri-Temp Robust)
+            # =========================================================
+            if "Mean & Cpk" in plot_type:
+                ax2 = ax.twinx()
+                styles = {
+                    "Room": ("green", "o", "-"),
+                    "Cold": ("blue", "D", "--"),
+                    "Hot": ("red", "s", ":"),
+                    "Data": ("black", "x", "-.")
+                }
+
+                def get_temp(p_name):
+                    if "(Room)" in p_name: return "Room"
+                    if "(Cold)" in p_name: return "Cold"
+                    if "(Hot)" in p_name: return "Hot"
+                    return "Data"
+
+                # Find specific columns (e.g., Icc Room, Icc Hot)
+                all_params = self.measure_long["Parameter"].unique()
+                relevant_cols = [p for p in all_params if self._get_base(p) == param]
+
+                # Gather data by temp
+                temp_groups = {}
+                for col in relevant_cols:
+                    temp = get_temp(col)
+                    if temp not in temp_groups:
+                        temp_groups[temp] = {"sheets": [], "means": [], "cpks": []}
+
+                    for s in sheet_order:
+                        temp_groups[temp]["sheets"].append(s)
+                        df = self.data_dict[s]
+                        if col in df.columns:
+                            v = df[col].dropna()
+                            if not v.empty:
+                                temp_groups[temp]["means"].append(v.mean())
+                                l, u = self.limits_dict[s].get(col, (np.nan, np.nan))
+                                cpk = self._calc_robust_cpk(v, l, u)
+                                temp_groups[temp]["cpks"].append(cpk)
+                            else:
+                                temp_groups[temp]["means"].append(np.nan)
+                                temp_groups[temp]["cpks"].append(np.nan)
+                        else:
+                            temp_groups[temp]["means"].append(np.nan)
+                            temp_groups[temp]["cpks"].append(np.nan)
+
+                # Plot
+                lines, labels = [], []
+                for temp, data in temp_groups.items():
+                    # Skip if no data
+                    if all(pd.isna(x) for x in data["means"]): continue
+
+                    c, mk, ls = styles.get(temp, styles["Data"])
+                    l1 = ax.plot(data["sheets"], data["means"], color=c, marker=mk, ls="-", alpha=0.8,
+                                 label=f"{temp} Mean")
+                    l2 = ax2.plot(data["sheets"], data["cpks"], color=c, marker=mk, ls=ls, lw=1.5, alpha=0.5,
+                                  label=f"{temp} Cpk")
+                    lines.extend(l1 + l2)
+                    labels.extend([l1[0].get_label(), l2[0].get_label()])
+
+                ax.set_title(f"Tri-Temp Trend: {param}")
+                ax.set_ylabel("Mean Value")
+                ax2.set_ylabel("Cpk (Dashed)")
+                ax2.axhline(1.33, color="gray", ls="--", alpha=0.5)
+                if lines:
+                    ax.legend(lines, labels, loc='upper left', fontsize=8, ncol=2)
+                ax.grid(True, alpha=0.3)
+
+            # =========================================================
+            # MODE 2: Box Plot (Spread)
+            # =========================================================
+            elif "Box Plot" in plot_type:
+                sns.boxplot(data=subset, x="Sheet", y="Value", hue="Sheet", legend=False, ax=ax, palette="Blues",
+                            showfliers=False)
+                sns.stripplot(data=subset, x="Sheet", y="Value", ax=ax, color="black", alpha=0.3, size=2, jitter=True)
+                ax.set_title(f"Distribution Trend: {param}")
+                ax.set_xlabel("Readpoint")
+                ax.grid(True, axis='y', alpha=0.5)
+
+            # =========================================================
+            # MODE 3: Spaghetti Plot (Maverick Detection)
+            # =========================================================
+            elif "Spaghetti" in plot_type:
+                unique_sn = subset["SN"].nunique()
+                alpha_val = 0.5 if unique_sn < 50 else 0.1
+                sns.lineplot(data=subset, x="Sheet", y="Value", hue="SN", estimator=None, units="SN", ax=ax,
+                             palette="dark:grey", legend=False, alpha=alpha_val, lw=1)
+
+                # Highlight Mean
+                sns.lineplot(data=subset, x="Sheet", y="Value", ax=ax, color="red", lw=3, errorbar=None, label="Mean")
+                ax.set_title(f"Individual Unit Trajectories (N={unique_sn})")
+                ax.set_xlabel("Readpoint")
+                ax.legend(loc='upper right')
+
+            # =========================================================
+            # MODE 4: Drift Analysis (Robust)
+            # =========================================================
+            elif "Drift" in plot_type:
+                # Identify correct columns (Room/Cold/Hot) for this param
+                all_params = self.measure_long["Parameter"].unique()
+                relevant_cols = [p for p in all_params if self._get_base(p) == param]
+                drift_subset = self.measure_long[self.measure_long["Parameter"].isin(relevant_cols)].copy()
+
+                if drift_subset.empty: return
+
+                drift_subset["Sheet"] = drift_subset["Sheet"].astype(str)
+                pivoted = drift_subset.pivot_table(index="SN", columns="Sheet", values="Value", aggfunc='first')
+
+                valid_sheets = [s for s in sheet_order if s in pivoted.columns]
+                if len(valid_sheets) < 2:
+                    ax.text(0.5, 0.5, "Insufficient timepoints for drift analysis", ha='center')
                 else:
-                    mean_series[t].append(np.nan)
-                    cpk_series[t].append(np.nan)
+                    pivoted = pivoted[valid_sheets]
+                    inc_drift = pivoted.diff(axis=1)
+                    t0 = pivoted.iloc[:, 0]
+                    cum_drift = pivoted.subtract(t0, axis=0)
+                    cum_mean = cum_drift.mean(axis=0)
 
-        mean_handles = []
-        cpk_handles = []
-        for t in temps:
-            ys_m = mean_series[t]
-            if any(not pd.isna(x) for x in ys_m):
-                c = mean_colors.get(t, "black")
-                label = f"{t} Mean" if self.is_tritemp else "Mean"
-                h = ax.plot(x_labels, ys_m, marker="o", linestyle="-", label=label, color=c)[0]
-                mean_handles.append(h)
+                    melted = inc_drift.reset_index().melt(id_vars="SN", var_name="Sheet", value_name="Drift")
 
-        for t in temps:
-            ys_c = cpk_series[t]
-            if any(not pd.isna(x) for x in ys_c):
-                c, ls, mk = cpk_styles.get(t, ("purple", ":", "X"))
-                label = f"{t} Cpk" if self.is_tritemp else "Cpk"
-                h = ax2.plot(x_labels, ys_c, marker=mk, linestyle=ls, linewidth=2.0, label=label, color=c)[0]
-                cpk_handles.append(h)
+                    ax2 = ax.twinx()
+                    ax.axhline(0, color='black', alpha=0.3)
+                    sns.boxplot(data=melted, x="Sheet", y="Drift", hue="Sheet", legend=False, ax=ax, palette="coolwarm",
+                                showfliers=False, boxprops=dict(alpha=0.6))
 
-        ax2.axhline(1.33, color="gray", linestyle=":", label="1.33")
-        ax.set_xlabel("Sheet / Lot")
-        ax.set_ylabel(f"{param} Mean")
-        ax.set_title(f"Detailed Trend: {param}")
-        ax.set_xticklabels(x_labels, rotation=45, ha="right")
-        ax2.set_ylabel("Cpk")
+                    ax2.plot(range(len(valid_sheets)), cum_mean.values, color="purple", marker="D", ls="--", lw=2,
+                             label="Cumulative Mean Drift")
 
-        handles = mean_handles + cpk_handles
-        labels = [h.get_label() for h in handles]
-        ax.legend(handles, labels, loc="upper left")
+                    ax.set_title(f"Step-by-Step vs Cumulative Drift: {param}")
+                    ax.set_ylabel("Incremental Drift (Step N - N-1)")
+                    ax2.set_ylabel("Total Mean Drift (vs T0)", color="purple")
+                    ax2.tick_params(axis='y', labelcolor="purple")
+                    ax2.legend(loc='upper left')
+                    ax.grid(True, alpha=0.3)
 
-        self.trend_canvas.draw()
+            self.trend_fig.tight_layout()
+            self.trend_canvas.draw()
+
+        except Exception as e:
+            # Catch crashes (like NameError or ValueError) and show them
+            messagebox.showerror("Plot Error", f"An error occurred while plotting:\n{str(e)}")
+            # Clear the canvas so the user knows it failed
+            if self.trend_fig:
+                self.trend_fig.clf()
+                self.trend_canvas.draw()
 
     # ----------------- Distributions tab -----------------
     def plot_distribution(self):
@@ -1121,6 +1397,61 @@ class QualAnalyzerV20:
         if pd.isna(cpl):
             return cpu
         return min(cpu, cpl)
+
+    def _calc_robust_cpk(self, v, l, u):
+        # 1. Safety Check: Not enough data
+        if v.empty or len(v) < 5:
+            return np.nan
+
+        # 2. Check for Zero Variance (Constant data)
+        # If the standard deviation is effectively 0, Cpk is technically infinite
+        # (if within spec) or 0 (if out of spec). We return NaN to avoid plot errors.
+        if v.std() < 1e-9:
+            return np.nan
+
+        # 3. Normality Test (Shapiro-Wilk)
+        # If p > 0.05, we assume Normal distribution.
+        stat, p_value = stats.shapiro(v)
+        is_normal = p_value > 0.05
+
+        cpu = np.inf
+        cpl = np.inf
+
+        if is_normal:
+            # --- Parametric Calculation (Mean/Std) ---
+            m, s = v.mean(), v.std()
+
+            # Calculate Upper/Lower Cpk only if limits exist
+            if not pd.isna(u):
+                cpu = (u - m) / (3 * s)
+            if not pd.isna(l):
+                cpl = (m - l) / (3 * s)
+
+        else:
+            # --- Non-Parametric Calculation (Percentiles) ---
+            median = v.median()
+            # 99.865th percentile ~= +3 sigma
+            p99_865 = np.percentile(v, 99.865)
+            # 0.135th percentile ~= -3 sigma
+            p0_135 = np.percentile(v, 0.135)
+
+            # Safety: Prevent division by zero if percentiles equal median (flat data)
+            upper_spread = max(1e-9, p99_865 - median)
+            lower_spread = max(1e-9, median - p0_135)
+
+            if not pd.isna(u):
+                cpu = (u - median) / upper_spread
+            if not pd.isna(l):
+                cpl = (median - l) / lower_spread
+
+        # 4. Final Result Handling
+        result = min(cpu, cpl)
+
+        # If both limits were NaN, result is still inf. Return NaN instead.
+        if result == np.inf:
+            return np.nan
+
+        return result
 
     def _sort_cpk_tree(self, col, reverse):
         data = [(self.tree_cpk.set(k, col), k) for k in self.tree_cpk.get_children("")]
