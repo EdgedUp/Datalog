@@ -8,6 +8,11 @@ from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
 import os
 from scipy import stats
+from scipy.spatial import distance
+import re # Ensure this is imported at the top of your file, or inside the method
+import sklearn
+from matplotlib.backends.backend_pdf import PdfPages
+import datetime
 
 # Plot style
 sns.set_theme(style="whitegrid")
@@ -103,12 +108,14 @@ class QualAnalyzerV20:
         self.tab_trend = ttk.Frame(self.tabs)
         self.tab_report = ttk.Frame(self.tabs)
         self.tab_visuals = ttk.Frame(self.tabs)
+        self.tab_corr = ttk.Frame(self.tabs)  # <--- NEW TAB
 
         self.tabs.add(self.tab_inspect, text="Data Inspector")
         self.tabs.add(self.tab_cpk, text="Cpk Health Check")
         self.tabs.add(self.tab_fail, text="Failure Analysis")
         self.tabs.add(self.tab_assess, text="Lot Assessment")
         self.tabs.add(self.tab_trend, text="Detailed Trend")
+        self.tabs.add(self.tab_corr, text="Correlation Matrix")  # <--- ADD TAB
         self.tabs.add(self.tab_report, text="Report Generator")
         self.tabs.add(self.tab_visuals, text="Distributions")
 
@@ -117,6 +124,7 @@ class QualAnalyzerV20:
         self._setup_fail_tab()
         self._setup_assess_tab()
         self._setup_trend_tab()
+        self._setup_corr_tab()  # <--- CALL SETUP
         self._setup_report_tab()
         self._setup_visuals_tab()
 
@@ -234,6 +242,216 @@ class QualAnalyzerV20:
         self.tree_raw.update_idletasks()
 
     # ----------------- Other tabs setup -----------------
+
+    def _setup_corr_tab(self):
+        frame = ttk.Frame(self.tab_corr)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # 1. Control Bar
+        ctrl = ttk.Frame(frame, padding=5)
+        ctrl.pack(fill=tk.X)
+
+        # Sheet Selection
+        ttk.Label(ctrl, text="Sheet:").pack(side=tk.LEFT)
+        self.combo_corr_sheet = ttk.Combobox(ctrl, state="readonly", width=15)
+        self.combo_corr_sheet.pack(side=tk.LEFT, padx=5)
+
+        # NEW: Temperature Filter Dropdown
+        ttk.Label(ctrl, text="Temperature:").pack(side=tk.LEFT, padx=(15, 2))
+        self.var_corr_temp = tk.StringVar(value="Room")
+        self.combo_corr_temp = ttk.Combobox(ctrl, textvariable=self.var_corr_temp, state="readonly", width=10)
+        self.combo_corr_temp["values"] = ("Room", "Cold", "Hot", "All")
+        self.combo_corr_temp.pack(side=tk.LEFT, padx=5)
+        self.combo_corr_temp.bind("<<ComboboxSelected>>", lambda e: self.plot_correlation_matrix())
+
+        # --- NEW: Plot Type Selector (Heatmap vs Dendrogram) ---
+        ttk.Label(ctrl, text="View:").pack(side=tk.LEFT, padx=(10, 2))
+        self.var_corr_type = tk.StringVar(value="Heatmap")
+        self.combo_corr_type = ttk.Combobox(ctrl, textvariable=self.var_corr_type, state="readonly", width=12)
+        self.combo_corr_type["values"] = ("Heatmap", "Dendrogram (Clusters)")
+        self.combo_corr_type.pack(side=tk.LEFT, padx=5)
+        self.combo_corr_type.bind("<<ComboboxSelected>>", lambda e: self.plot_correlation_matrix())
+        # -------------------------------------------------------
+
+        # Action Button
+        ttk.Button(ctrl, text="Update Matrix", command=self.plot_correlation_matrix).pack(side=tk.LEFT, padx=15)
+        ttk.Label(ctrl, text="(Click cell for Scatter Plot)").pack(side=tk.LEFT, padx=5)
+        self.lbl_corr_hint = ttk.Label(ctrl, text="(Click cell/leaf for details)", font=("Arial", 9, "italic"))
+        self.lbl_corr_hint.pack(side=tk.LEFT, padx=5)
+
+        # 2. Split View: Heatmap (Left) and Scatter Detail (Right)
+        paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        self.corr_heat_frame = ttk.Frame(paned)
+        self.corr_scatter_frame = ttk.Frame(paned)
+
+        paned.add(self.corr_heat_frame, weight=3)
+        paned.add(self.corr_scatter_frame, weight=2)
+
+        # Initialize Canvas placeholders
+        self.corr_heat_canvas = None
+        self.corr_scatter_canvas = None
+        self.corr_fig_heat = None
+        self.corr_fig_scatter = None
+
+        # State storage
+        self.current_corr_df = None
+        self.current_corr_raw_data = None
+        self.heatmap_ax = None
+
+    def plot_correlation_matrix(self):
+        """Generates Heatmap or Dendrogram based on selection."""
+        import scipy.cluster.hierarchy as sch
+
+        try:
+            sheet = self.combo_corr_sheet.get()
+            temp_mode = self.var_corr_temp.get()
+            plot_type = self.var_corr_type.get()
+
+            if not sheet or sheet not in self.data_dict: return
+
+            # 1. Data Prep (Same as before)
+            df = self.data_dict[sheet].copy()
+            if "SN" in df.columns: df = df.set_index("SN")
+            raw_numeric = df.select_dtypes(include=[np.number])
+
+            # Filter by Temp
+            if temp_mode != "All":
+                cols = [c for c in raw_numeric.columns if temp_mode.lower() in c.lower()]
+                if not cols:
+                    messagebox.showinfo("Info", f"No '{temp_mode}' data found.")
+                    return
+                numeric_df = raw_numeric[cols]
+            else:
+                numeric_df = raw_numeric
+
+            # Remove constants
+            numeric_df = numeric_df.loc[:, numeric_df.std() > 1e-9]
+            if numeric_df.shape[1] < 2: return
+
+            # 2. Calculations
+            self.current_corr_df = numeric_df.corr(method='pearson')
+            self.current_corr_raw_data = numeric_df
+
+            # 3. Setup Canvas
+            if self.corr_heat_canvas is None:
+                self.corr_fig_heat = plt.Figure(figsize=(8, 8), dpi=100)
+                self.corr_heat_canvas = FigureCanvasTkAgg(self.corr_fig_heat, master=self.corr_heat_frame)
+                self.corr_heat_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+                self.corr_heat_canvas.mpl_connect('button_press_event', self.on_heatmap_click)
+            else:
+                self.corr_fig_heat.clf()
+
+            # 4. Draw Based on Type
+            ax = self.corr_fig_heat.add_subplot(111)
+
+            if plot_type == "Heatmap":
+                # ... Existing Heatmap Logic ...
+                n_params = len(numeric_df.columns)
+                annot = True if n_params < 20 else False
+                sns.heatmap(self.current_corr_df, ax=ax, cmap="RdBu_r", center=0,
+                            square=True, annot=annot, fmt=".2f", annot_kws={"size": 8},
+                            cbar_kws={'label': 'Pearson r'})
+                ax.set_title(f"Correlation Matrix: {sheet} ({temp_mode})", fontweight="bold")
+                plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+                # Ensure the axis is stored for click events
+                self.heatmap_ax = ax
+
+            elif plot_type == "Dendrogram (Clusters)":
+                # --- NEW: Dendrogram Logic ---
+                # We use the correlation matrix to define 'distance' (1 - r)
+                # Parameters that correlate highly (r=1.0) have distance 0.
+                dist_matrix = 1 - self.current_corr_df.abs()
+
+                # Perform Ward Clustering
+                linkage = sch.linkage(sch.distance.squareform(dist_matrix), method='ward')
+
+                # Plot
+                dendro = sch.dendrogram(
+                    linkage,
+                    labels=numeric_df.columns,
+                    ax=ax,
+                    leaf_rotation=90,
+                    leaf_font_size=8
+                )
+
+                ax.set_title(f"Parameter Clustering: {sheet}\n(Grouped by Behavior Similarity)", fontweight="bold")
+                ax.set_ylabel("Cluster Distance (Height = Dissimilarity)")
+                ax.grid(True, axis='y', alpha=0.3)
+
+                # Disable the heatmap click handler for this view (or adapt it later)
+                self.heatmap_ax = None
+                self.lbl_corr_hint.config(text="(Clustering View: Height shows how distinct groups are)")
+
+            self.corr_fig_heat.tight_layout()
+            self.corr_heat_canvas.draw()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Plot failed:\n{str(e)}")
+
+    def on_heatmap_click(self, event):
+        """Robust click handler for the Heatmap."""
+        try:
+            if self.current_corr_df is None: return
+            if event.xdata is None or event.ydata is None: return
+
+            # Verify click is inside the heatmap axes
+            if hasattr(self, 'heatmap_ax') and event.inaxes != self.heatmap_ax:
+                return
+
+            col_idx = int(event.xdata)
+            row_idx = int(event.ydata)
+
+            cols = self.current_corr_df.columns
+
+            if 0 <= col_idx < len(cols) and 0 <= row_idx < len(cols):
+                param_x = cols[col_idx]
+                param_y = cols[row_idx]
+                self.plot_corr_scatter(param_x, param_y)
+
+        except Exception as e:
+            print(f"Click Error: {e}")
+
+    def plot_corr_scatter(self, px, py):
+        """Draw the detailed regression plot."""
+        try:
+            if self.corr_scatter_canvas is None:
+                self.corr_fig_scatter = plt.Figure(figsize=(5, 5), dpi=100)
+                self.corr_scatter_canvas = FigureCanvasTkAgg(self.corr_fig_scatter, master=self.corr_scatter_frame)
+                self.corr_scatter_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            else:
+                self.corr_fig_scatter.clf()
+
+            ax = self.corr_fig_scatter.add_subplot(111)
+
+            data = self.current_corr_raw_data[[px, py]].dropna()
+            r_val = self.current_corr_df.loc[px, py]
+
+            sns.regplot(
+                data=data,
+                x=px,
+                y=py,
+                ax=ax,
+                scatter_kws={'alpha': 0.5, 's': 30, 'edgecolor': 'black'},
+                line_kws={'color': 'red'}
+            )
+
+            ax.set_title(f"R = {r_val:.4f}", fontweight="bold")
+            # Truncate labels if too long
+            ax.set_xlabel(px if len(px) < 20 else px[:17] + "...")
+            ax.set_ylabel(py if len(py) < 20 else py[:17] + "...")
+            ax.grid(True, alpha=0.3)
+
+            ax.text(0.05, 0.95, f"N = {len(data)}", transform=ax.transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8))
+
+            self.corr_fig_scatter.tight_layout()
+            self.corr_scatter_canvas.draw()
+        except Exception as e:
+            messagebox.showerror("Plot Error", f"Could not plot scatter:\n{str(e)}")
+
     def _setup_cpk_tab(self):
         frame = ttk.Frame(self.tab_cpk)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -295,20 +513,68 @@ class QualAnalyzerV20:
         frame = ttk.Frame(self.tab_assess)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        top = ttk.Frame(frame)
-        top.pack(fill=tk.X, pady=5)
-        ttk.Button(top, text="Export Assessment to CSV", command=self.export_assessment_csv).pack(side=tk.LEFT, padx=5)
+        # Top Control Bar
+        top = ttk.Frame(frame, padding=5)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="Run Multivariate Assessment", command=self.calculate_assessment).pack(side=tk.LEFT,
+                                                                                                    padx=5)
+        ttk.Button(top, text="Export Assessment CSV", command=self.export_assessment_csv).pack(side=tk.LEFT, padx=5)
 
-        self.txt_assess = tk.Text(frame, height=8, font=("Consolas", 11))
-        self.txt_assess.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(top, text="(Click any dot in the plot to see WHY it is an outlier)",
+                  font=("Arial", 9, "italic")).pack(side=tk.LEFT, padx=15)
 
-        cols = ("Rank", "SN", "Deviation Score", "Max |Z|", "Count |Z|>3", "Count |Z|>6", "Failures")
-        self.tree_rank = ttk.Treeview(frame, columns=cols, show="headings")
+        # Main Split: Top (Table + Plot) vs Bottom (Contribution Analysis)
+        main_paned = ttk.PanedWindow(frame, orient=tk.VERTICAL)
+        main_paned.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        top_pane = ttk.Frame(main_paned)
+        self.bottom_pane = ttk.Frame(main_paned)  # For Contribution Plot
+
+        main_paned.add(top_pane, weight=3)
+        main_paned.add(self.bottom_pane, weight=2)
+
+        # Top Split: Table (Left) vs Scatter (Right)
+        sub_paned = ttk.PanedWindow(top_pane, orient=tk.HORIZONTAL)
+        sub_paned.pack(fill=tk.BOTH, expand=True)
+
+        left_pane = ttk.Frame(sub_paned)
+        right_pane = ttk.Frame(sub_paned)
+        sub_paned.add(left_pane, weight=1)
+        sub_paned.add(right_pane, weight=2)
+
+        # --- Table Setup ---
+        self.txt_assess = tk.Text(left_pane, height=8, font=("Consolas", 9))
+        self.txt_assess.pack(fill=tk.X, padx=5, pady=5)
+
+        cols = ("Rank", "SN", "M-Dist", "Univar", "Fails")
+        self.tree_rank = ttk.Treeview(left_pane, columns=cols, show="headings")
         for c in cols:
             self.tree_rank.heading(c, text=c)
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree_rank.yview)
+            w = 50 if c == "Rank" else 80
+            self.tree_rank.column(c, width=w, anchor="center")
+
+        vsb = ttk.Scrollbar(left_pane, orient="vertical", command=self.tree_rank.yview)
         self.tree_rank.configure(yscrollcommand=vsb.set)
-        self.tree_rank.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.tree_rank.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # --- Assessment Scatter Setup ---
+        self.assess_fig = plt.Figure(figsize=(6, 4), dpi=100)
+        self.assess_canvas = FigureCanvasTkAgg(self.assess_fig, master=right_pane)
+        self.assess_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # CRITICAL: Bind the click
+        self.assess_canvas.mpl_connect('button_press_event', self.on_assess_click)
+
+        # --- Bottom Pane: Contribution Plot Setup ---
+        self.contrib_fig = plt.Figure(figsize=(8, 3), dpi=100)
+        self.contrib_canvas = FigureCanvasTkAgg(self.contrib_fig, master=self.bottom_pane)
+        self.contrib_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Placeholder text
+        ax = self.contrib_fig.add_subplot(111)
+        ax.text(0.5, 0.5, "Click a unit in the scatter plot above to analyze its drivers.",
+                ha='center', va='center', color='gray')
+        ax.axis('off')
 
     def _setup_trend_tab(self):
         frame = ttk.Frame(self.tab_trend)
@@ -334,7 +600,9 @@ class QualAnalyzerV20:
             "Mean & Cpk Trend",
             "Box Plot Series (Spread)",
             "Spaghetti Plot (Individual Tracks)",
-            "Drift / Delta Analysis (vs T0)"
+            "Drift / Delta Analysis (vs T0)",
+            "Shift Scatter (Final vs Initial)",  # <--- NEW OPTION
+            "Tempco Scatter (Hot - Cold)"
         )
         self.combo_trend_type.pack(side=tk.LEFT, padx=5)
         self.combo_trend_type.current(0)
@@ -351,16 +619,46 @@ class QualAnalyzerV20:
     def _setup_report_tab(self):
         frame = ttk.Frame(self.tab_report)
         frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- Section 1: Top Controls (PDF Generation) ---
+        ctrl_frame = ttk.Frame(frame, padding=10)
+        ctrl_frame.pack(fill=tk.X)
+
+        # Big Button for the Professional Report
+        btn_pdf = ttk.Button(
+            ctrl_frame,
+            text="Generate Professional PDF Report",
+            command=self.generate_full_pdf_report
+        )
+        btn_pdf.pack(pady=5, ipadx=10, ipady=5)
+
+        ttk.Label(ctrl_frame, text="(Generates a multi-page PDF with charts, tables, and outlier analysis)",
+                  font=("Arial", 9, "italic")).pack(pady=(0, 10))
+
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
+
+        # --- Section 2: On-Screen Report (Original Functionality) ---
+        ttk.Label(frame, text="Quick Screen Report", font=("Arial", 10, "bold")).pack(pady=(10, 2))
+
         ttk.Button(frame, text="Generate Screen Report", command=self.generate_screen_report).pack(pady=5)
-        self.report_canvas = tk.Canvas(frame)
-        sb = ttk.Scrollbar(frame, command=self.report_canvas.yview)
+
+        # Scrollable Area for Screen Report
+        # Note: We use a separate frame for the canvas to handle the scrollbar layout correctly
+        canvas_container = ttk.Frame(frame)
+        canvas_container.pack(fill=tk.BOTH, expand=True)
+
+        self.report_canvas = tk.Canvas(canvas_container)
+        sb = ttk.Scrollbar(canvas_container, orient="vertical", command=self.report_canvas.yview)
+
         self.report_frame = ttk.Frame(self.report_canvas)
         self.report_frame.bind(
             "<Configure>",
             lambda e: self.report_canvas.configure(scrollregion=self.report_canvas.bbox("all")),
         )
+
         self.report_canvas.create_window((0, 0), window=self.report_frame, anchor="nw")
         self.report_canvas.configure(yscrollcommand=sb.set)
+
         self.report_canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
@@ -390,6 +688,45 @@ class QualAnalyzerV20:
 
         self.viz_frame = ttk.Frame(frame)
         self.viz_frame.pack(fill=tk.BOTH, expand=True)
+
+    def plot_corr_scatter(self, px, py):
+        """Draw the detailed regression plot on the right panel."""
+        try:
+            if self.corr_scatter_canvas is None:
+                self.corr_fig_scatter = plt.Figure(figsize=(5, 5), dpi=100)
+                self.corr_scatter_canvas = FigureCanvasTkAgg(self.corr_fig_scatter, master=self.corr_scatter_frame)
+                self.corr_scatter_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            else:
+                self.corr_fig_scatter.clf()
+
+            ax = self.corr_fig_scatter.add_subplot(111)
+
+            data = self.current_corr_raw_data[[px, py]].dropna()
+            r_val = self.current_corr_df.loc[px, py]
+
+            # Regression Plot
+            sns.regplot(
+                data=data,
+                x=px,
+                y=py,
+                ax=ax,
+                scatter_kws={'alpha': 0.5, 's': 30, 'edgecolor': 'black'},
+                line_kws={'color': 'red'}
+            )
+
+            ax.set_title(f"Relationship Detail\nR = {r_val:.4f}", fontweight="bold")
+            ax.set_xlabel(px)
+            ax.set_ylabel(py)
+            ax.grid(True, alpha=0.3)
+
+            # Annotate sample size
+            ax.text(0.05, 0.95, f"N = {len(data)}", transform=ax.transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8))
+
+            self.corr_fig_scatter.tight_layout()
+            self.corr_scatter_canvas.draw()
+        except Exception as e:
+            messagebox.showerror("Plot Error", f"Could not plot scatter:\n{str(e)}")
 
     # ----------------- Structure detection -----------------
     def _detect_struct(self, df):
@@ -579,6 +916,9 @@ class QualAnalyzerV20:
                 how="left",
             )
 
+            for col in ["Value", "LSL", "USL"]:
+                merged[col] = pd.to_numeric(merged[col], errors='coerce')
+
             merged["FailHigh"] = (~merged["USL"].isna()) & (merged["Value"] > merged["USL"])
             merged["FailLow"]  = (~merged["LSL"].isna()) & (merged["Value"] < merged["LSL"])
             merged["FailType"] = np.where(
@@ -611,6 +951,11 @@ class QualAnalyzerV20:
             self.populate_failures()
             self.calculate_assessment()
             self.lbl_status.config(text="Analysis Complete.")
+
+            if hasattr(self, 'combo_corr_sheet'):
+                self.combo_corr_sheet['values'] = list(self.data_dict.keys())
+                if self.data_dict:
+                    self.combo_corr_sheet.current(0)
 
         except Exception as e:
             messagebox.showerror("Error", str(e))
@@ -1038,6 +1383,195 @@ class QualAnalyzerV20:
                     ax2.legend(loc='upper left')
                     ax.grid(True, alpha=0.3)
 
+            # =========================================================
+            # MODE 5: Shift Scatter (Headroom Analysis)
+            # =========================================================
+            elif "Shift Scatter" in plot_type:
+                # 1. Pivot Data to get Columns = Readpoints
+                all_params = self.measure_long["Parameter"].unique()
+                relevant_cols = [p for p in all_params if self._get_base(p) == param]
+                shift_subset = self.measure_long[self.measure_long["Parameter"].isin(relevant_cols)].copy()
+
+                if shift_subset.empty: return
+
+                shift_subset["Sheet"] = shift_subset["Sheet"].astype(str)
+                # Pivot: Index=SN, Columns=Sheet, Values=Value
+                pivoted = shift_subset.pivot_table(index="SN", columns="Sheet", values="Value", aggfunc='first')
+
+                # Filter to valid chronological sheets
+                valid_sheets = [s for s in sheet_order if s in pivoted.columns]
+                if len(valid_sheets) < 2:
+                    ax.text(0.5, 0.5, "Need at least 2 readpoints (Initial & Final) to plot shift.", ha='center')
+                    self.trend_canvas.draw()
+                    return
+
+                # 2. Define Initial (T0) and Final (Tx)
+                # We compare the FIRST recorded step vs the LAST recorded step
+                col_initial = valid_sheets[0]
+                col_final = valid_sheets[-1]
+
+                data_x = pivoted[col_initial]
+                data_y = pivoted[col_final]
+
+                # 3. Get Limits (for the "Box")
+                # We try to find limits from the Final sheet first
+                l, u = self.limits_dict[col_final].get(param, (np.nan, np.nan))
+                # If specific param name fails, try searching the 'relevant_cols' list for a match
+                if pd.isna(l) and pd.isna(u):
+                    # Try to grab limits from the first variant found
+                    for c in relevant_cols:
+                        tl, tu = self.limits_dict[col_final].get(c, (np.nan, np.nan))
+                        if not pd.isna(tl): l, u = tl, tu; break
+
+                # 4. Plotting
+                # Plot the Identity Line (No Drift)
+                min_val = min(data_x.min(), data_y.min())
+                max_val = max(data_x.max(), data_y.max())
+
+                # Add 5% buffer for visuals
+                span = max_val - min_val
+                if span == 0: span = 0.1
+                plot_min = min_val - span * 0.1
+                plot_max = max_val + span * 0.1
+
+                # Reference Line (y=x)
+                ax.plot([plot_min, plot_max], [plot_min, plot_max], color='gray', linestyle='--', alpha=0.5,
+                        label="No Drift (y=x)")
+
+                # Scatter Points
+                # Color code: Drift Up (Red), Drift Down (Blue)
+                drift = data_y - data_x
+                colors = ['#d62728' if d > 0 else '#1f77b4' for d in drift]
+
+                scatter = ax.scatter(data_x, data_y, c=colors, edgecolors='black', alpha=0.7, s=40)
+
+                # 5. Draw the "Spec Box" (if limits exist)
+                if not pd.isna(l):
+                    ax.axvline(l, color='red', linestyle='-', linewidth=1)  # Initial LSL
+                    ax.axhline(l, color='red', linestyle='-', linewidth=1)  # Final LSL
+                    ax.text(l, plot_max, "LSL", color='red', ha='right', va='top', rotation=90)
+
+                if not pd.isna(u):
+                    ax.axvline(u, color='red', linestyle='-', linewidth=1)  # Initial USL
+                    ax.axhline(u, color='red', linestyle='-', linewidth=1)  # Final USL
+                    ax.text(u, plot_min, "USL", color='red', ha='right', va='bottom', rotation=90)
+
+                # 6. Labels & Stats
+                ax.set_title(f"Shift Analysis: {col_final} vs {col_initial}", fontweight="bold")
+                ax.set_xlabel(f"Initial Value ({col_initial})")
+                ax.set_ylabel(f"Final Value ({col_final})")
+
+                # Annotate largest drifter
+                max_drift_idx = drift.abs().idxmax()
+                if not pd.isna(max_drift_idx):
+                    mx = data_x.loc[max_drift_idx]
+                    my = data_y.loc[max_drift_idx]
+                    ax.annotate(f"Max Drift: SN {max_drift_idx}",
+                                xy=(mx, my), xytext=(mx, my + span * 0.05),
+                                arrowprops=dict(facecolor='black', shrink=0.05),
+                                ha='center', fontweight='bold')
+
+                ax.grid(True, linestyle=':', alpha=0.6)
+                ax.set_aspect('equal', adjustable='datalim')  # Square aspect ratio is crucial for y=x interpretation
+
+            # =========================================================
+            # MODE 6: Tempco Scatter (Thermal Sensitivity)
+            # =========================================================
+            elif "Tempco Scatter" in plot_type:
+                # 1. Identify the Hot, Cold, and Room variations of this parameter
+                # We need to scan the columns of the CURRENT sheet (or T0) to find the variants
+                # Since Tempco is usually an intrinsic property, we can look at T0 (Sheet 0)
+                # or allow the user to see how Tempco changes over time (by using the current sheet).
+                # For robustness, let's calculate it for ALL sheets and use the most recent one
+                # or simply pick the first sheet where both Hot/Cold exist (Time Zero).
+
+                target_sheet = sheet_order[0]  # Default to T0 (Initial Characterization)
+
+                # Try to find the specific column names
+                # We construct the expected names based on your parser logic
+                col_room = f"{param} (Room)"
+                col_cold = f"{param} (Cold)"
+                col_hot = f"{param} (Hot)"
+
+                # Check if these exist in the dataset
+                # Note: Your parser strips brackets sometimes, or adds them.
+                # We need a robust search.
+
+                df = self.data_dict[target_sheet].copy()
+                cols = df.columns
+
+                # Fuzzy match helper
+                def find_col(substring):
+                    matches = [c for c in cols if substring.lower() in c.lower() and param.lower() in c.lower()]
+                    # Prefer exact matches of the base param + suffix
+                    return matches[0] if matches else None
+
+                real_room = find_col("(Room)")
+                real_cold = find_col("(Cold)")
+                real_hot = find_col("(Hot)")
+
+                # Fallback: If param name itself doesn't have suffix (e.g. data was "Icc", "Icc Cold")
+                if not real_room: real_room = find_col("Room") or param  # Assume base is room?
+                if not real_cold: real_cold = find_col("Cold")
+                if not real_hot:  real_hot = find_col("Hot")
+
+                if not real_cold or not real_hot:
+                    ax.text(0.5, 0.5, f"Cannot find Hot/Cold data for '{param}'\nin sheet '{target_sheet}'",
+                            ha='center')
+                    self.trend_canvas.draw()
+                    return
+
+                # 2. Extract Data
+                # Filter out NaNs to ensure we have matched pairs
+                data = df[["SN", real_room, real_cold, real_hot]].dropna()
+
+                if data.empty:
+                    ax.text(0.5, 0.5, "No overlapping SNs with full Tri-Temp data.", ha='center')
+                    return
+
+                # 3. Calculate Tempco (Swing)
+                # We just do Delta V. If you knew degrees C, you could divide by (125 - -40).
+                # For visual outlier detection, raw Delta is sufficient and safer.
+                data["Swing"] = data[real_hot] - data[real_cold]
+
+                # 4. Plot
+                # X-Axis: Room Value (Magnitude)
+                # Y-Axis: Thermal Swing (Sensitivity)
+
+                # Color code by "Abnormal Swing"
+                # Robust Outlier Detection: Median +/- 3 * IQR
+                median_swing = data["Swing"].median()
+                iqr_swing = data["Swing"].quantile(0.75) - data["Swing"].quantile(0.25)
+                limit_upper = median_swing + 3 * iqr_swing
+                limit_lower = median_swing - 3 * iqr_swing
+
+                colors = []
+                for s in data["Swing"]:
+                    if s > limit_upper or s < limit_lower:
+                        colors.append('red')
+                    else:
+                        colors.append('teal')
+
+                ax.scatter(data[real_room], data["Swing"], c=colors, edgecolors='black', alpha=0.7, s=45)
+
+                # Add reference lines
+                ax.axhline(median_swing, color='gray', linestyle='--', label="Median Swing")
+                ax.axhline(limit_upper, color='red', linestyle=':', alpha=0.5, label="Statistical Limit (3*IQR)")
+                ax.axhline(limit_lower, color='red', linestyle=':', alpha=0.5)
+
+                ax.set_title(f"Tempco Analysis (Thermal Sensitivity)\n{param} [Hot - Cold]", fontweight="bold")
+                ax.set_xlabel(f"Room Temp Value ({real_room})")
+                ax.set_ylabel(f"Thermal Swing ({real_hot} - {real_cold})")
+
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+
+                # Annotate extreme outliers
+                outliers = data[(data["Swing"] > limit_upper) | (data["Swing"] < limit_lower)]
+                for idx, row in outliers.iterrows():
+                    ax.text(row[real_room], row["Swing"], str(row["SN"]), fontsize=8, color='darkred',
+                            fontweight='bold')
+
             self.trend_fig.tight_layout()
             self.trend_canvas.draw()
 
@@ -1177,68 +1711,507 @@ class QualAnalyzerV20:
             )
         self.lbl_fail_summary.config(text=f"Total Failures Detected: {len(self.failures)}")
 
-    def calculate_assessment(self):
-        all_z = []
-        for s, df in self.data_dict.items():
-            cols = [c for c in df.columns if c != "SN"]
-            num = df[cols].select_dtypes(include=[np.number])
-            if "SN" in df.columns and not num.empty:
-                num = num.copy()
-                num.index = df["SN"].astype(str)
-                z = (num - num.mean()) / num.std()
-                all_z.append(z)
-
-        if not all_z:
+    def on_assess_click(self, event):
+        """Finds the closest unit to the click and runs contribution analysis."""
+        if event.inaxes is None or not hasattr(self, 'pca_transformed'):
             return
 
-        full_z = pd.concat(all_z, axis=1).fillna(0)
-        abs_z = full_z.abs()
-        scores = abs_z.sum(axis=1)
-        max_z = abs_z.max(axis=1)
-        cnt_z3 = (abs_z > 3).sum(axis=1)
-        cnt_z6 = (abs_z > 6).sum(axis=1)
+        # Find closest SN
+        # X-axis: UnivarScore, Y-axis: Mahalanobis
+        df = self.pca_data_clean
 
-        rank_df = pd.DataFrame({
-            "Score": scores,
-            "MaxZ": max_z,
-            "Count3": cnt_z3,
-            "Count6": cnt_z6,
-        }).sort_values("Score")
+        # Simple distance check in plot coordinates
+        # (This is approximate but sufficient for UI clicking)
+        click_x, click_y = event.xdata, event.ydata
 
-        best = rank_df.head(5).index.tolist()
-        worst = rank_df.tail(5).index.tolist()[::-1]
+        # Calculate Euclidean distance to every point in the plot
+        distances = np.sqrt(
+            (df["UnivarScore"] - click_x) ** 2 +
+            (df["Mahalanobis"] - click_y) ** 2
+        )
 
-        txt = "LOT ASSESSMENT REPORT\n" + "=" * 30 + "\n"
-        txt += f"Best Performers (lowest overall |z|): {', '.join(map(str, best))}\n"
-        txt += f"Worst Performers (highest overall |z|): {', '.join(map(str, worst))}\n"
-        txt += "\nStrong outliers (Max |z| > 6):\n"
-        strong = rank_df[rank_df["MaxZ"] > 6]
-        if strong.empty:
-            txt += "  None detected.\n"
-        else:
-            for sn, row in strong.sort_values("MaxZ", ascending=False).iterrows():
-                txt += f"  SN {sn}: MaxZ={row['MaxZ']:.2f}, Count>|6|={int(row['Count6'])}\n"
+        # Get closest
+        closest_idx = distances.argmin()
+        closest_sn = df.index[closest_idx]
+        min_dist = distances.iloc[closest_idx]
 
-        self.txt_assess.delete("1.0", tk.END)
-        self.txt_assess.insert(tk.END, txt)
+        # Threshold to ignore accidental clicks on whitespace
+        # (Scale dependent, but < 5.0 usually works for these chart ranges)
+        if min_dist < 10.0:
+            self.plot_contribution(closest_sn)
 
-        self.tree_rank.delete(*self.tree_rank.get_children())
-        rank_desc = rank_df.sort_values("Score", ascending=False)
-        fail_counts = pd.DataFrame(self.failures)["SN"].value_counts() if self.failures else pd.Series(dtype=int)
-        for i, (sn, row) in enumerate(rank_desc.iterrows(), start=1):
-            self.tree_rank.insert(
-                "",
-                "end",
-                values=(
-                    i,
-                    sn,
-                    f"{row['Score']:.2f}",
-                    f"{row['MaxZ']:.2f}",
-                    int(row["Count3"]),
-                    int(row["Count6"]),
-                    fail_counts.get(sn, 0),
-                ),
+    def plot_contribution(self, sn):
+        """
+        Decomposes the Mahalanobis Distance to find the 'Guilty' parameters.
+        """
+        try:
+            # 1. Get the PCA scores for this SN
+            sn_idx = self.pca_data_clean.index.get_loc(sn)
+            pca_scores = self.pca_transformed[sn_idx]
+
+            # 2. Calculate feature impact
+            loadings = self.pca_model.components_
+            weighted_loadings = pca_scores.reshape(-1, 1) * loadings
+            feature_impact = np.abs(weighted_loadings).sum(axis=0)
+
+            # Map back to feature names
+            features = self.pca_data_clean.columns.drop(["Mahalanobis", "UnivarScore"])
+            impact_series = pd.Series(feature_impact, index=features)
+
+            # Top 10 Contributors
+            top_10 = impact_series.sort_values(ascending=False).head(10)
+
+            # 3. Plot
+            self.contrib_fig.clf()
+            ax = self.contrib_fig.add_subplot(111)
+
+            # Calculate raw Z-scores for coloring (Red=High, Blue=Low)
+            raw_z = (self.pca_data_clean.loc[sn, top_10.index] - self.pca_data_clean[top_10.index].mean()) / \
+                    self.pca_data_clean[top_10.index].std()
+            colors = ['#d62728' if z > 0 else '#1f77b4' for z in raw_z]
+
+            # --- FIXED SEABORN CALL ---
+            sns.barplot(
+                x=top_10.values,
+                y=top_10.index,
+                hue=top_10.index,  # <--- NEW: Map hue to Y variable
+                legend=False,  # <--- NEW: Hide redundant legend
+                ax=ax,
+                palette=colors
             )
+            # --------------------------
+
+            ax.set_title(f"Root Cause Analysis: SN {sn} (Why is it an outlier?)", fontweight='bold')
+            ax.set_xlabel("Contribution to Anomaly Score")
+
+            # Add value labels
+            for i, (val, z) in enumerate(zip(top_10.values, raw_z)):
+                direction = "(+)" if z > 0 else "(-)"
+                ax.text(val, i, f" {direction} {abs(z):.1f}σ", va='center', fontsize=8)
+
+            self.contrib_fig.tight_layout()
+            self.contrib_canvas.draw()
+
+        except Exception as e:
+            print(f"Contribution Logic Error: {e}")
+
+    def generate_full_pdf_report(self):
+        """Generates a comprehensive, audit-ready PDF Qualification Report."""
+        if not self.data_dict:
+            messagebox.showinfo("Error", "No data loaded to report.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF Documents", "*.pdf")],
+            title="Save Qualification Report"
+        )
+        if not path:
+            return
+
+        # Prepare Shared Data
+        unique_sn = set()
+        for df in self.data_dict.values():
+            if "SN" in df.columns: unique_sn.update(df["SN"].dropna().astype(str).tolist())
+
+        total_units = len(unique_sn)
+        unique_fails = set(f['SN'] for f in self.failures)
+        fail_count = len(unique_fails)
+        yield_pct = ((total_units - fail_count) / total_units * 100) if total_units else 0.0
+
+        try:
+            with PdfPages(path) as pdf:
+
+                # =================================================
+                # PAGE 1: EXECUTIVE DASHBOARD
+                # =================================================
+                fig = plt.Figure(figsize=(8.5, 11), dpi=100)
+
+                # Title Block
+                ax_title = fig.add_axes([0.1, 0.85, 0.8, 0.1])
+                ax_title.axis('off')
+                ax_title.text(0.5, 0.7, "Microcircuit Qualification Report", ha='center', fontsize=24,
+                              fontweight='bold', color='#2C3E50')
+                ax_title.text(0.5, 0.3, f"Date: {datetime.datetime.now().strftime('%Y-%m-%d')}", ha='center',
+                              fontsize=12, color='gray')
+
+                # KPI Box (Yield & Counts)
+                ax_kpi = fig.add_axes([0.1, 0.65, 0.8, 0.15])
+                ax_kpi.axis('off')
+                ax_kpi.text(0.15, 0.8, f"TOTAL UNITS: {total_units}", fontsize=12, fontweight='bold')
+                ax_kpi.text(0.55, 0.8, f"TOTAL LOTS/STEPS: {len(self.data_dict)}", fontsize=12, fontweight='bold')
+
+                # Dynamic Color for Yield
+                yield_color = 'green' if yield_pct > 95 else 'orange' if yield_pct > 90 else 'red'
+                ax_kpi.text(0.15, 0.4, f"PASS YIELD: {yield_pct:.1f}%", fontsize=16, fontweight='bold',
+                            color=yield_color)
+                ax_kpi.text(0.55, 0.4, f"FAILING UNITS: {fail_count}", fontsize=16, fontweight='bold', color='crimson')
+
+                # "High Risk" Warning (Lowest Cpk Params)
+                # Find worst 5 Cpks across all sheets
+                worst_cpks = []
+                for s, df in self.data_dict.items():
+                    for c in df.columns:
+                        if c == "SN": continue
+                        v = df[c].dropna()
+                        l, u = self.limits_dict[s].get(c, (np.nan, np.nan))
+                        val = self._calc_robust_cpk(v, l, u)
+                        if not pd.isna(val) and val < 1.67:
+                            worst_cpks.append((val, c, s))
+
+                worst_cpks.sort(key=lambda x: x[0])
+
+                ax_risk = fig.add_axes([0.1, 0.35, 0.8, 0.25])
+                ax_risk.axis('off')
+                ax_risk.text(0.0, 1.0, "CRITICAL PROCESS RISKS (Lowest Cpk):", fontsize=12, fontweight='bold',
+                             color='#E74C3C')
+
+                if worst_cpks:
+                    y_pos = 0.85
+                    for val, param, sheet in worst_cpks[:8]:
+                        cpk_color = 'red' if val < 1.33 else 'orange'
+                        ax_risk.text(0.05, y_pos, f"{val:.2f} Cpk  |  {sheet}: {param}", fontsize=10, color=cpk_color,
+                                     family='monospace')
+                        y_pos -= 0.1
+                else:
+                    ax_risk.text(0.05, 0.8, "No parameters below 1.67 Cpk detected.", fontsize=10, color='green')
+
+                # Footer
+                ax_foot = fig.add_axes([0.1, 0.05, 0.8, 0.05])
+                ax_foot.axis('off')
+                ax_foot.text(0.5, 0.5, "Page 1 - Executive Summary", ha='center', fontsize=8, color='gray')
+
+                pdf.savefig(fig)
+
+                # =================================================
+                # PAGE 2: FAILURE DETAILS & PARETO
+                # =================================================
+                if self.failures:
+                    fig = plt.Figure(figsize=(8.5, 11))
+
+                    # 1. Failure Pareto (Bar Chart)
+                    ax_pareto = fig.add_subplot(211)
+                    fail_df = pd.DataFrame(self.failures)
+
+                    # Count failures by Parameter
+                    counts = fail_df["Parameter"].value_counts().head(10)
+                    sns.barplot(x=counts.values, y=counts.index, ax=ax_pareto, palette="Reds_r")
+                    ax_pareto.set_title("Top 10 Failing Parameters (Pareto)", fontweight='bold')
+                    ax_pareto.set_xlabel("Count of Failures")
+
+                    # 2. Detailed Table (First 25)
+                    ax_table = fig.add_subplot(212)
+                    ax_table.axis('off')
+
+                    # Clean table data
+                    disp_df = fail_df[["Sheet", "SN", "Parameter", "Value", "Type"]].head(25)
+                    cols = disp_df.columns
+                    cell_text = []
+                    for row in disp_df.itertuples(index=False):
+                        cell_text.append([str(x) for x in row])
+
+                    table = ax_table.table(cellText=cell_text, colLabels=cols, loc='upper center', cellLoc='left')
+                    table.auto_set_font_size(False)
+                    table.set_fontsize(8)
+                    table.scale(1, 1.2)
+                    ax_table.set_title("Failure Log (First 25 Events)", fontweight='bold', y=1.0)
+
+                    fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+                    pdf.savefig(fig)
+
+                # =================================================
+                # PAGE 3: DRIFT ANALYSIS (Automated Stability Check)
+                # =================================================
+                # Find the parameter with the highest mean drift
+                if self.measure_long is not None:
+                    # Filter for numeric params only
+                    # We need at least 2 sheets
+                    sheets = list(self.data_dict.keys())
+                    if len(sheets) >= 2:
+                        best_drift_param = None
+                        max_drift_mag = -1.0
+
+                        # Scan a subset of params to save time (or all)
+                        # Let's check unique base params
+                        base_params = list(set([self._get_base(p) for p in self.measure_long["Parameter"].unique()]))
+
+                        for p in base_params[:50]:  # Limit scan to first 50 to avoid freeze
+                            # Reuse Mode 5 logic essentially
+                            sub = self.measure_long[
+                                self.measure_long["Parameter"].apply(lambda x: self._get_base(x) == p)]
+                            piv = sub.pivot_table(index="SN", columns="Sheet", values="Value")
+                            if piv.shape[1] > 1:
+                                drift = (piv.iloc[:, -1] - piv.iloc[:, 0]).abs().mean()
+                                # Normalize by value magnitude to find relative drift?
+                                # Or just raw. Let's do raw for now.
+                                if drift > max_drift_mag:
+                                    max_drift_mag = drift
+                                    best_drift_param = p
+
+                        if best_drift_param:
+                            fig = plt.Figure(figsize=(8.5, 11))
+                            ax = fig.add_subplot(111)
+
+                            # Re-run Shift Scatter logic for this param
+                            # (Simplified version of Mode 5)
+                            sub = self.measure_long[
+                                self.measure_long["Parameter"].apply(lambda x: self._get_base(x) == best_drift_param)]
+                            piv = sub.pivot_table(index="SN", columns="Sheet", values="Value")
+                            valid_sheets = [s for s in sheets if s in piv.columns]
+
+                            x = piv[valid_sheets[0]]
+                            y = piv[valid_sheets[-1]]
+
+                            min_v, max_v = min(x.min(), y.min()), max(x.max(), y.max())
+                            span = (max_v - min_v) * 0.1
+
+                            ax.plot([min_v - span, max_v + span], [min_v - span, max_v + span], 'k--', alpha=0.3,
+                                    label="Ideal Stability")
+                            drift_vals = y - x
+                            colors = ['red' if d > 0 else 'blue' for d in drift_vals]
+                            ax.scatter(x, y, c=colors, alpha=0.6, edgecolors='black')
+
+                            ax.set_title(
+                                f"Worst Case Drift Analysis: {best_drift_param}\n({valid_sheets[-1]} vs {valid_sheets[0]})",
+                                fontweight='bold', fontsize=14)
+                            ax.set_xlabel(f"Initial Value ({valid_sheets[0]})")
+                            ax.set_ylabel(f"Final Value ({valid_sheets[-1]})")
+                            ax.grid(True, alpha=0.3)
+
+                            # Add text stats
+                            stats_txt = f"Mean Drift: {drift_vals.mean():.4f}\nMax Drift: {drift_vals.abs().max():.4f}"
+                            ax.text(0.05, 0.95, stats_txt, transform=ax.transAxes,
+                                    bbox=dict(facecolor='white', alpha=0.8))
+
+                            pdf.savefig(fig)
+
+                # =================================================
+                # PAGE 4: MULTIVARIATE RISK & ROOT CAUSE
+                # =================================================
+                # 1. Run Assessment
+                from sklearn.decomposition import PCA
+                from sklearn.preprocessing import StandardScaler
+                import scipy.stats as stats
+                from scipy.spatial import distance
+
+                df_wide = self.measure_long.pivot_table(index="SN", columns="Parameter", values="Value", aggfunc='mean')
+                df_clean = df_wide.dropna(axis=1, how='any')
+                df_clean = df_clean.loc[:, df_clean.std() > 1e-9]
+
+                if df_clean.shape[1] > 2:
+                    fig = plt.Figure(figsize=(8.5, 11))
+
+                    # -- Plot 1: The Maverick Plot --
+                    ax_mv = fig.add_subplot(211)
+
+                    scaler = StandardScaler()
+                    X_scaled = scaler.fit_transform(df_clean)
+                    pca = PCA(n_components=0.99)
+                    X_pca = pca.fit_transform(X_scaled)
+
+                    cov = np.cov(X_pca.T)
+                    inv_cov = np.linalg.inv(cov)
+                    mean_pca = X_pca.mean(axis=0)
+                    centered = X_pca - mean_pca
+                    m_dists = [distance.mahalanobis(c, np.zeros_like(c), inv_cov) for c in centered]
+
+                    dof = X_pca.shape[1]
+                    threshold = np.sqrt(stats.chi2.ppf(0.999, dof))
+
+                    colors = ['red' if x > threshold else 'steelblue' for x in m_dists]
+                    ax_mv.scatter(range(len(m_dists)), m_dists, c=colors, alpha=0.7)
+                    ax_mv.axhline(threshold, color='red', ls='--', label=f"Limit: {threshold:.1f}")
+                    ax_mv.set_title("Multivariate Outlier Detection (Mavericks)", fontweight='bold')
+                    ax_mv.set_ylabel("Mahalanobis Distance")
+
+                    # -- Plot 2: Auto-Root Cause for #1 Outlier --
+                    # Find max distance index
+                    max_idx = np.argmax(m_dists)
+                    max_dist = m_dists[max_idx]
+
+                    if max_dist > threshold:
+                        ax_rc = fig.add_subplot(212)
+
+                        # Run decomposition logic manually
+                        sn_idx = max_idx
+                        pca_scores = X_pca[sn_idx]
+                        loadings = pca.components_
+                        weighted = pca_scores.reshape(-1, 1) * loadings
+                        impact = np.abs(weighted).sum(axis=0)
+
+                        feats = df_clean.columns
+                        impact_s = pd.Series(impact, index=feats).sort_values(ascending=False).head(10)
+
+                        # Plot Bar
+                        sns.barplot(x=impact_s.values, y=impact_s.index, ax=ax_rc, palette="Reds_r")
+                        ax_rc.set_title(f"Root Cause Analysis for Top Outlier (SN {df_clean.index[max_idx]})",
+                                        fontweight='bold')
+                        ax_rc.set_xlabel("Contribution to Anomaly Score")
+                    else:
+                        ax_rc = fig.add_subplot(212)
+                        ax_rc.text(0.5, 0.5, "No Statistical Outliers Detected.\n(Root Cause Analysis Skipped)",
+                                   ha='center')
+                        ax_rc.axis('off')
+
+                    fig.tight_layout()
+                    pdf.savefig(fig)
+
+                # =================================================
+                # PAGE 5: PHYSICS CLUSTERING (Dendrogram)
+                # =================================================
+                import scipy.cluster.hierarchy as sch
+                first_sheet = list(self.data_dict.keys())[0]
+                df_phys = self.data_dict[first_sheet].select_dtypes(include=[np.number])
+                df_phys = df_phys.loc[:, df_phys.std() > 1e-9]
+
+                if df_phys.shape[1] > 1:
+                    fig = plt.Figure(figsize=(8.5, 11))
+                    ax_d = fig.add_subplot(111)
+
+                    corr = df_phys.corr()
+                    dist = 1 - corr.abs()
+                    linkage = sch.linkage(sch.distance.squareform(dist), method='ward')
+
+                    sch.dendrogram(linkage, labels=df_phys.columns, ax=ax_d, leaf_rotation=90, leaf_font_size=8)
+                    ax_d.set_title(f"Device Physics Map (Dendrogram)\nSheet: {first_sheet}", fontweight='bold')
+                    ax_d.set_ylabel("Dissimilarity (Height)")
+
+                    fig.tight_layout()
+                    pdf.savefig(fig)
+
+            messagebox.showinfo("Success", f"Professional Report Saved:\n{path}")
+
+        except Exception as e:
+            messagebox.showerror("Report Error", f"Failed to generate PDF:\n{str(e)}")
+
+    def calculate_assessment(self):
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        import scipy.stats as stats
+
+        try:
+            # 1. Gather Data & Clean
+            if self.measure_long is None: return
+
+            # Pivot to Wide Format
+            df_wide = self.measure_long.pivot_table(index="SN", columns="Parameter", values="Value", aggfunc='mean')
+
+            # Drop columns with NaNs or Zero Variance
+            df_clean = df_wide.dropna(axis=1, how='any')
+            df_clean = df_clean.loc[:, df_clean.std() > 1e-9]
+
+            if df_clean.shape[1] < 2:
+                self.txt_assess.delete("1.0", tk.END)
+                self.txt_assess.insert(tk.END, "Insufficient data for multivariate analysis.")
+                return
+
+            # 2. PCA (Dimensionality Reduction) - The Robustness Fix
+            # We scale the data first (Critical for PCA/Mahalanobis)
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(df_clean)
+
+            # Keep components explaining 99% of variance (Usually drops 190 vars down to ~20)
+            pca = PCA(n_components=0.99)
+            X_pca = pca.fit_transform(X_scaled)
+
+            # 3. Calculate Mahalanobis Distance on the PCA components
+            # Since PCA components are uncorrelated and unit variance (if whitened, but standard is close),
+            # Mahalanobis is simply the Euclidean distance from origin in PCA space.
+
+            # More robustly: Calculate covariance of the PCA scores
+            cov = np.cov(X_pca.T)
+            inv_cov = np.linalg.inv(cov)
+
+            mean_pca = X_pca.mean(axis=0)
+            centered_pca = X_pca - mean_pca
+
+            m_dists = []
+            for i in range(len(centered_pca)):
+                x = centered_pca[i]
+                d = distance.mahalanobis(x, np.zeros_like(x), inv_cov)
+                m_dists.append(d)
+
+            df_clean["Mahalanobis"] = m_dists
+
+            # 4. Univariate Score (for X-Axis context)
+            z_scores = (df_clean - df_clean.mean()) / df_clean.std()
+            z_cols = [c for c in z_scores.columns if c != "Mahalanobis"]
+            df_clean["UnivarScore"] = z_scores[z_cols].abs().sum(axis=1)
+
+            # 5. Threshold Calculation (The Bug Fix)
+            # Degrees of freedom = Number of PCA components kept (not original vars)
+            dof = X_pca.shape[1]
+
+            # CRITICAL FIX: Take SQRT of Chi2 to match the linear Distance scale
+            limit_sq = stats.chi2.ppf(0.999, dof)
+            threshold = np.sqrt(limit_sq)
+
+            outliers = df_clean[df_clean["Mahalanobis"] > threshold]
+
+            # 6. Update UI Text
+            txt = "MULTIVARIATE LOT ASSESSMENT (PCA-Enhanced)\n" + "=" * 40 + "\n"
+            txt += f"Original Variables: {df_wide.shape[1]}\n"
+            txt += f"PCA Components (99% Var): {dof}\n"
+            txt += f"Total Units: {len(df_clean)}\n"
+            txt += f"Multivariate Outliers (p<0.001): {len(outliers)}\n"
+
+            if not outliers.empty:
+                txt += "\nTOP MAVERICKS:\n"
+                for sn, row in outliers.sort_values("Mahalanobis", ascending=False).head(5).iterrows():
+                    txt += f"  SN {sn}: Dist={row['Mahalanobis']:.2f} (Limit={threshold:.1f})\n"
+            else:
+                txt += "\nNo statistical outliers detected.\n"
+
+            self.txt_assess.delete("1.0", tk.END)
+            self.txt_assess.insert(tk.END, txt)
+
+            # 7. Update Table
+            self.tree_rank.delete(*self.tree_rank.get_children())
+            ranked = df_clean.sort_values("Mahalanobis", ascending=False)
+            fail_counts = pd.DataFrame(self.failures)["SN"].value_counts() if self.failures else pd.Series(dtype=int)
+
+            for i, (sn, row) in enumerate(ranked.iterrows(), start=1):
+                self.tree_rank.insert("", "end", values=(
+                    i, sn, f"{row['Mahalanobis']:.2f}", f"{row['UnivarScore']:.2f}", fail_counts.get(sn, 0)
+                ))
+
+                # STORE DATA FOR CLICK HANDLER
+                self.pca_model = pca
+                self.pca_data_clean = df_clean  # Original values (for lookup)
+                self.pca_transformed = X_pca  # PCA scores
+                self.pca_scaler = scaler  # To un-scale if needed
+                self.pca_inv_cov = inv_cov  # For math
+
+            # 8. Plotting
+            self.assess_fig.clf()
+            ax = self.assess_fig.add_subplot(111)
+
+            # Dynamic Colors: Red for outliers, Blue for normal
+            colors = ['red' if x > threshold else 'steelblue' for x in df_clean["Mahalanobis"]]
+
+            ax.scatter(df_clean["UnivarScore"], df_clean["Mahalanobis"], alpha=0.6, edgecolors='black', c=colors)
+
+            # Plot the Limit Line
+            ax.axhline(threshold, color='red', linestyle='--', label=f"Limit: {threshold:.1f}")
+
+            # Auto-Scale Y-Axis to make data visible (fix "Lumping")
+            max_y = max(threshold * 1.2, df_clean["Mahalanobis"].max() * 1.1)
+            ax.set_ylim(0, max_y)
+
+            ax.set_title(f"Outlier Detection (PCA: {dof} Dim)", fontweight='bold')
+            ax.set_xlabel("Univariate Score")
+            ax.set_ylabel("Mahalanobis Distance")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # Annotate outliers
+            for sn, row in outliers.iterrows():
+                ax.text(row["UnivarScore"], row["Mahalanobis"], str(sn), fontsize=8, color='darkred', fontweight='bold')
+
+            self.assess_canvas.draw()
+
+        except Exception as e:
+            messagebox.showerror("Assessment Error", f"Analysis failed:\n{str(e)}")
 
     # ----------------- Report / export -----------------
     def generate_screen_report(self):
