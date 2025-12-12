@@ -110,12 +110,14 @@ class QualAnalyzerV20:
         self.tab_visuals = ttk.Frame(self.tabs)
         self.tab_corr = ttk.Frame(self.tabs)  # <--- NEW TAB
 
+        self.tab_scatter = ttk.Frame(self.tabs)  # <--- NEW TAB
         self.tabs.add(self.tab_inspect, text="Data Inspector")
         self.tabs.add(self.tab_cpk, text="Cpk Health Check")
         self.tabs.add(self.tab_fail, text="Failure Analysis")
         self.tabs.add(self.tab_assess, text="Lot Assessment")
         self.tabs.add(self.tab_trend, text="Detailed Trend")
         self.tabs.add(self.tab_corr, text="Correlation Matrix")  # <--- ADD TAB
+        self.tabs.add(self.tab_scatter, text="Scatter Explorer")  # <--- ADD HERE
         self.tabs.add(self.tab_report, text="Report Generator")
         self.tabs.add(self.tab_visuals, text="Distributions")
 
@@ -125,6 +127,7 @@ class QualAnalyzerV20:
         self._setup_assess_tab()
         self._setup_trend_tab()
         self._setup_corr_tab()  # <--- CALL SETUP
+        self._setup_scatter_tab()  # <--- CALL SETUP
         self._setup_report_tab()
         self._setup_visuals_tab()
 
@@ -2435,6 +2438,173 @@ class QualAnalyzerV20:
         for idx, (_, k) in enumerate(data):
             self.tree_cpk.move(k, "", idx)
         self.tree_cpk.heading(col, command=lambda: self._sort_cpk_tree(col, not reverse))
+
+    def _setup_scatter_tab(self):
+        frame = ttk.Frame(self.tab_scatter)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # 1. Control Bar
+        ctrl = ttk.Frame(frame, padding=5)
+        ctrl.pack(fill=tk.X)
+
+        # X-Axis Selector
+        ttk.Label(ctrl, text="X-Axis:").pack(side=tk.LEFT)
+        self.combo_scat_x = ttk.Combobox(ctrl, state="readonly", width=20)
+        self.combo_scat_x.pack(side=tk.LEFT, padx=5)
+
+        # Y-Axis Selector
+        ttk.Label(ctrl, text="Y-Axis:").pack(side=tk.LEFT, padx=(10, 2))
+        self.combo_scat_y = ttk.Combobox(ctrl, state="readonly", width=20)
+        self.combo_scat_y.pack(side=tk.LEFT, padx=5)
+
+        # Grouping Selector (Color)
+        ttk.Label(ctrl, text="Color By:").pack(side=tk.LEFT, padx=(10, 2))
+        self.var_scat_hue = tk.StringVar(value="Sheet")
+        self.combo_scat_hue = ttk.Combobox(ctrl, textvariable=self.var_scat_hue, state="readonly", width=12)
+        # Added 'Temp' as a standard option now that we handle it intelligently
+        self.combo_scat_hue["values"] = ("Sheet", "Temp", "None")
+        self.combo_scat_hue.pack(side=tk.LEFT, padx=5)
+
+        # Sheet Filter
+        ttk.Label(ctrl, text="Filter Sheet:").pack(side=tk.LEFT, padx=(10, 2))
+        self.combo_scat_sheet = ttk.Combobox(ctrl, state="readonly", width=15)
+        self.combo_scat_sheet.pack(side=tk.LEFT, padx=5)
+
+        # --- NEW: Smart List Populator ---
+        def update_scat_options(event=None):
+            if not self.data_dict: return
+
+            # Get unique BASE parameters (e.g., "Icc" instead of "Icc (Room)")
+            if self.measure_long is not None:
+                raw_params = self.measure_long["Parameter"].unique()
+                base_params = sorted(list(set([self._get_base(p) for p in raw_params])))
+
+                self.combo_scat_x['values'] = base_params
+                self.combo_scat_y['values'] = base_params
+
+            # Get sheets
+            sheets = list(self.data_dict.keys())
+            self.combo_scat_sheet['values'] = ["All Combined"] + sheets
+            if not self.combo_scat_sheet.get(): self.combo_scat_sheet.current(0)
+
+        self.combo_scat_x.bind('<Button-1>', update_scat_options)
+        self.combo_scat_y.bind('<Button-1>', update_scat_options)
+
+        # Plot Button
+        ttk.Button(ctrl, text="Plot Relationship", command=self.plot_scatter_explorer).pack(side=tk.LEFT, padx=15)
+
+        # 2. Plot Area
+        self.scat_fig = plt.Figure(figsize=(8, 6), dpi=100)
+        self.scat_canvas = FigureCanvasTkAgg(self.scat_fig, master=frame)
+        self.scat_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def plot_scatter_explorer(self):
+        try:
+            param_x_base = self.combo_scat_x.get()
+            param_y_base = self.combo_scat_y.get()
+            hue_mode = self.var_scat_hue.get()
+            target_sheet = self.combo_scat_sheet.get()
+
+            if not param_x_base or not param_y_base: return
+            if self.measure_long is None: return
+
+            # 1. Filter Data by Sheet first (Efficiency)
+            df = self.measure_long.copy()
+            if target_sheet and target_sheet != "All Combined":
+                df = df[df["Sheet"] == target_sheet]
+
+            # 2. Identify Rows matching the Base Parameters
+            # We add a 'Base' column temporarily to filter
+            df["Base"] = df["Parameter"].apply(self._get_base)
+
+            # Filter down to just the X and Y params we care about
+            sub = df[df["Base"].isin([param_x_base, param_y_base])].copy()
+
+            if sub.empty:
+                messagebox.showinfo("Info", "No data found for these parameters.")
+                return
+
+            # 3. Extract Temperature for Alignment
+            # We need to know that "Icc (Hot)" goes with "Vout (Hot)"
+            def get_temp_category(p_name):
+                lower = p_name.lower()
+                if "hot" in lower: return "Hot"
+                if "cold" in lower: return "Cold"
+                if "room" in lower: return "Room"
+                return "Unknown"  # Fallback
+
+            sub["Temp"] = sub["Parameter"].apply(get_temp_category)
+
+            # 4. PIVOT: The Magic Step
+            # We pivot so that we have columns for the Base Parameters
+            # Index includes ['SN', 'Sheet', 'Temp'] ensuring strict alignment
+            # (e.g. SN1 at Sheet1 at Hot Temp)
+
+            pivoted = sub.pivot_table(
+                index=["SN", "Sheet", "Temp"],
+                columns="Base",
+                values="Value"
+            ).reset_index()
+
+            # Remove rows where one of the values is missing (e.g. maybe X was measured at Hot but Y wasn't)
+            pivoted = pivoted.dropna(subset=[param_x_base, param_y_base])
+
+            if pivoted.empty:
+                messagebox.showinfo("Info",
+                                    "No overlapping data found (Check if both params were measured at same temps).")
+                return
+
+            # 5. Plot
+            self.scat_fig.clf()
+            ax = self.scat_fig.add_subplot(111)
+
+            # Determine Hue Column
+            hue_col = None
+            palette = None
+
+            if hue_mode == "Sheet":
+                hue_col = "Sheet"
+                palette = "tab10"
+            elif hue_mode == "Temp":
+                hue_col = "Temp"
+                palette = {"Room": "green", "Cold": "blue", "Hot": "red", "Unknown": "gray"}
+
+            # Scatter Plot
+            sns.scatterplot(
+                data=pivoted,
+                x=param_x_base,
+                y=param_y_base,
+                hue=hue_col,
+                style=hue_col,
+                palette=palette,
+                alpha=0.7,
+                edgecolor='black',
+                s=50,
+                ax=ax
+            )
+
+            # Optional: Add Regression Lines if grouped
+            if hue_col and len(pivoted) < 2000:
+                groups = pivoted[hue_col].unique()
+                for grp in groups:
+                    grp_data = pivoted[pivoted[hue_col] == grp]
+                    if len(grp_data) > 1:
+                        # Draw line manually to match color
+                        sns.regplot(
+                            data=grp_data, x=param_x_base, y=param_y_base,
+                            scatter=False, ci=None,
+                            line_kws={'alpha': 0.5, 'linewidth': 1, 'linestyle': '--'},
+                            ax=ax, color=None
+                        )
+
+            ax.set_title(f"Interactive Scatter: {param_x_base} vs {param_y_base}", fontweight='bold')
+            ax.grid(True, linestyle=':', alpha=0.6)
+
+            self.scat_fig.tight_layout()
+            self.scat_canvas.draw()
+
+        except Exception as e:
+            messagebox.showerror("Plot Error", f"Scatter failed:\n{str(e)}")
 
 
 if __name__ == "__main__":
