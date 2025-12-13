@@ -1,5 +1,6 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import tkinter as tk                # REQUIRED for IntVar, StringVar, Canvas, Text, etc.
+import ttkbootstrap as ttk          # REQUIRED for the styled Widgets (Button, Label, etc.)
+from tkinter import filedialog, messagebox  # Keep these as they are
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,6 +14,33 @@ import re # Ensure this is imported at the top of your file, or inside the metho
 import sklearn
 from matplotlib.backends.backend_pdf import PdfPages
 import datetime
+import mplcursors
+import threading
+import queue
+import xlsxwriter
+import plotly
+import dash
+import logging      # <--- REQUIRED for the fix
+import threading    # <--- Required for the background server
+import webbrowser   # <--- Required to open the browser automatically
+
+# --- ROBUST IMPORT: DASH ---
+try:
+    import dash
+    from dash import dcc, html, Input, Output, callback_context
+    import dash_bootstrap_components as dbc
+    DASH_AVAILABLE = True
+except ImportError:
+    DASH_AVAILABLE = False
+
+# --- ROBUST IMPORT: PLOTLY ---
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    import plotly.io as pio
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
 # Plot style
 sns.set_theme(style="whitegrid")
@@ -22,12 +50,15 @@ plt.rcParams.update({"figure.autolayout": True})
 class QualAnalyzerV20:
     def __init__(self, root):
         self.root = root
-        self.root.title("Microcircuit Qual Analyzer V20 (Smart Limits + Inspector Slider Fix)")
+        # Use a modern theme (e.g., 'darkly', 'superhero', 'cosmo')
+        self.style = ttk.Style(theme="darkly")
+        self.root.title("Microcircuit Qual Analyzer V21 (Dark Mode)")
         self.root.geometry("1600x950")
 
         # Data Storage
         self.data_dict = {}        # per sheet: wide data (SN + numeric cols)
         self.limits_dict = {}      # per sheet: {Parameter -> (LSL, USL)}
+        self.units_dict = {}  # <--- NEW: Stores {Sheet -> {Param -> Unit}}
         self.param_map = {}        # base param -> [sheets]
         self.raw_previews = {}     # per sheet: raw DataFrame (no header)
         self.failures = []         # list of failure dicts
@@ -40,11 +71,20 @@ class QualAnalyzerV20:
 
         # Config Vars
         self.var_header_row = tk.IntVar(value=5)
+        self.var_unit_row = tk.IntVar(value=6)  # <--- NEW
+        self.var_cond_row = tk.IntVar(value=7)  # <--- NEW
+        self.var_unit_row = tk.IntVar(value=6)  # <--- NEW
         self.var_usl_row = tk.IntVar(value=12)
         self.var_lsl_row = tk.IntVar(value=13)
         self.var_data_start = tk.IntVar(value=18)
         self.var_data_end = tk.IntVar(value=0)
         self.var_sn_col = tk.IntVar(value=0)
+        self.var_param_start_col = tk.IntVar(value=1)
+        self.var_bin_col = tk.IntVar(value=-1)
+
+        # --- NEW: Data Cleaning Config ---
+        self.var_magic_val = tk.DoubleVar(value=9999.0)  # Value to treat as "Error Code"
+        self.var_clean_zeros = tk.BooleanVar(value=True)  # If True, turn 0.0 into NaN after a failure
 
         # Inspector sizing controls
         self.var_col_width = tk.IntVar(value=50)   # px
@@ -94,8 +134,13 @@ class QualAnalyzerV20:
         ttk.Entry(control_frame, textvariable=self.var_goto_page, width=6).pack(side=tk.LEFT)
         ttk.Button(control_frame, text="Go", command=self.goto_page).pack(side=tk.LEFT, padx=2)
 
+        ttk.Button(control_frame, text="Toggle Theme ☀/☾", command=self.toggle_theme).pack(side=tk.RIGHT, padx=10)
+
         self.lbl_status = ttk.Label(control_frame, text="Ready. Please load a file.")
         self.lbl_status.pack(side=tk.LEFT, padx=15)
+        self.progress = ttk.Progressbar(control_frame, mode='indeterminate', length=200)
+        self.progress.pack(side=tk.LEFT, padx=5)
+        self.progress.pack_forget()  # Hide it initially
 
         # Tabs
         self.tabs = ttk.Notebook(self.root)
@@ -121,6 +166,11 @@ class QualAnalyzerV20:
         self.tabs.add(self.tab_report, text="Report Generator")
         self.tabs.add(self.tab_visuals, text="Distributions")
 
+        # CREATE A 12x12 CYAN SQUARE ICON
+        self.icon_param_start = tk.PhotoImage(width=12, height=12)
+        # Fill it with cyan color (you can change "cyan" to "#00FFFF")
+        self.icon_param_start.put("cyan", to=(0, 0, 11, 11))
+
         self._setup_inspect_tab()
         self._setup_cpk_tab()
         self._setup_fail_tab()
@@ -136,7 +186,7 @@ class QualAnalyzerV20:
         frame = ttk.Frame(self.tab_inspect)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        config = ttk.LabelFrame(frame, text="Parsing Config", padding=10)
+        config = ttk.Labelframe(frame, text="Parsing Config", padding=10)
         config.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
 
         def entry(lbl, var):
@@ -145,37 +195,41 @@ class QualAnalyzerV20:
             ttk.Label(f, text=lbl, width=18).pack(side=tk.LEFT)
             ttk.Entry(f, textvariable=var, width=8).pack(side=tk.RIGHT)
 
-        entry("Parameter (Row):", self.var_header_row)
-        entry("Max Limit (Row):", self.var_usl_row)
-        entry("Min Limit (Row):", self.var_lsl_row)
-        entry("Data Start (Row):", self.var_data_start)
+        # --- CONFIG INPUTS ---
+        entry("Parameter (Header):", self.var_header_row)
+        entry("Unit Row:", self.var_unit_row)  # <--- NEW
+        entry("Test Cond Row:", self.var_cond_row)  # <--- NEW
+        entry("Max Limit (USL):", self.var_usl_row)
+        entry("Min Limit (LSL):", self.var_lsl_row)
+        entry("Data Start:", self.var_data_start)
         entry("Data End (0=Auto):", self.var_data_end)
         entry("SN Column Idx:", self.var_sn_col)
+        entry("Param Start Col:", self.var_param_start_col)
+        entry("Bin Column Idx:", self.var_bin_col)
 
         ttk.Button(config, text="Apply Changes", command=self.reparse_file).pack(fill=tk.X, pady=10)
 
-        # Row-height slider only (column width slider is in top bar)
-        size_box = ttk.LabelFrame(config, text="Inspector Size", padding=5)
+        # Size Controls
+        size_box = ttk.Labelframe(config, text="Inspector Size", padding=5)
         size_box.pack(fill=tk.X, pady=10)
-
-        ttk.Label(size_box, text="Row Height").pack(anchor="w", pady=(0, 0))
-        row_scale = ttk.Scale(
-            size_box,
-            from_=16,
-            to=60,
-            orient="horizontal",
-            variable=self.var_row_height,
-            command=lambda v: self._apply_inspector_row_height(),
-        )
+        ttk.Label(size_box, text="Row Height").pack(anchor="w")
+        row_scale = ttk.Scale(size_box, from_=16, to=60, orient="horizontal",
+                              variable=self.var_row_height, command=lambda v: self._apply_inspector_row_height())
         row_scale.pack(fill=tk.X, pady=2)
 
-        leg = ttk.LabelFrame(config, text="Legend", padding=5)
+        # --- LEGEND ---
+        leg = ttk.Labelframe(config, text="Legend", padding=5)
         leg.pack(fill=tk.X, pady=10)
-        self._add_legend(leg, "Header Row", "#ffffcc")
-        self._add_legend(leg, "Limits", "#ffcccc")
-        self._add_legend(leg, "Data Start", "#ccffcc")
-        self._add_legend(leg, "Data End", "#000000")
+        self._add_legend(leg, "Header (Params)", "#ffffcc")  # Yellow
+        self._add_legend(leg, "Unit Row", "#e0ffff")  # Light Cyan
+        self._add_legend(leg, "Test Conditions", "#ffcc99")  # Peach/Orange (NEW)
+        self._add_legend(leg, "Max Limit", "#ffcccc")  # Light Red
+        self._add_legend(leg, "Min Limit", "#ccccff")  # Periwinkle/Purple
+        self._add_legend(leg, "Data Start", "#ccffcc")  # Light Green
+        self._add_legend(leg, "Data End", "black")
+        self._add_legend(leg, "Param Start Col", "cyan")
 
+        # Right Side (Grid)
         right = ttk.Frame(frame)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
@@ -185,21 +239,18 @@ class QualAnalyzerV20:
         self.combo_inspect_sheet.pack(side=tk.LEFT)
         self.combo_inspect_sheet.bind("<<ComboboxSelected>>", self.on_sheet_change)
 
-        ttk.Button(bar, text="< Prev", command=self.prev_page).pack(side=tk.LEFT, padx=5)
-        self.lbl_page = ttk.Label(bar, text="Page 1")
-        self.lbl_page.pack(side=tk.LEFT)
-        ttk.Button(bar, text="Next >", command=self.next_page).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bar, text="Verify Structure", command=self.verify_structure_map, bootstyle="info-outline").pack(
+            side=tk.LEFT, padx=10)
 
-        # Column width slider in top bar
+        # Pagination
+        ttk.Button(bar, text="<", width=3, command=self.prev_page).pack(side=tk.LEFT, padx=5)
+        self.lbl_page = ttk.Label(bar, text="Pg 1")
+        self.lbl_page.pack(side=tk.LEFT)
+        ttk.Button(bar, text=">", width=3, command=self.next_page).pack(side=tk.LEFT, padx=5)
+
         ttk.Label(bar, text="Col Width:").pack(side=tk.LEFT, padx=(15, 2))
-        self.scale_col_width = tk.Scale(
-            bar,
-            from_=50,
-            to=900,
-            orient=tk.HORIZONTAL,
-            showvalue=True,
-            command=self.update_col_width
-        )
+        self.scale_col_width = tk.Scale(bar, from_=50, to=900, orient=tk.HORIZONTAL, showvalue=False,
+                                        command=self.update_col_width)
         self.scale_col_width.set(self.var_col_width.get())
         self.scale_col_width.pack(side=tk.LEFT, padx=5)
 
@@ -215,17 +266,37 @@ class QualAnalyzerV20:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.tree_raw.tag_configure("HEADER", background="#ffffcc")
-        self.tree_raw.tag_configure("USL", background="#ffcccc")
-        self.tree_raw.tag_configure("LSL", background="#ccccff")
-        self.tree_raw.tag_configure("DATA_START", background="#ccffcc")
+        # --- TAG COLORS ---
+        self.tree_raw.tag_configure("HEADER", background="#ffffcc", foreground="black")
+        self.tree_raw.tag_configure("UNIT", background="#e0ffff", foreground="black")
+        self.tree_raw.tag_configure("COND", background="#ffcc99", foreground="black")  # <--- Updated to Peach
+        self.tree_raw.tag_configure("USL", background="#ffcccc", foreground="black")
+        self.tree_raw.tag_configure("LSL", background="#ccccff", foreground="black")
+        self.tree_raw.tag_configure("DATA_START", background="#ccffcc", foreground="black")
         self.tree_raw.tag_configure("DATA_END", background="black", foreground="white")
 
     def _add_legend(self, parent, text, color):
+        """
+        Adds a legend row. Uses a Canvas with a drawn rectangle to
+        guarantee visibility regardless of theme or OS.
+        """
+        # Container for the row
         f = ttk.Frame(parent)
-        f.pack(anchor="w")
-        tk.Label(f, bg=color, width=2).pack(side=tk.LEFT)
-        ttk.Label(f, text=text).pack(side=tk.LEFT, padx=5)
+        f.pack(anchor="w", pady=2, fill=tk.X)
+
+        # 1. THE CANVAS (The "Screen" we draw on)
+        # highlightthickness=0 removes the default white border
+        swatch = tk.Canvas(f, width=18, height=18, highlightthickness=0)
+        swatch.pack(side=tk.LEFT, padx=(5, 8))
+
+        # 2. THE DRAWING (The Color)
+        # We explicitly draw a rectangle from (0,0) to (18,18).
+        # fill=color sets the inside color.
+        # outline="gray" ensures you can see the box even if the color is white/black.
+        swatch.create_rectangle(0, 0, 18, 18, fill=color, outline="gray")
+
+        # 3. THE TEXT
+        ttk.Label(f, text=text).pack(side=tk.LEFT)
 
     def update_col_width(self, val):
         """Real-time update of inspector column widths from slider."""
@@ -283,7 +354,7 @@ class QualAnalyzerV20:
         self.lbl_corr_hint.pack(side=tk.LEFT, padx=5)
 
         # 2. Split View: Heatmap (Left) and Scatter Detail (Right)
-        paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        paned = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
         self.corr_heat_frame = ttk.Frame(paned)
@@ -418,7 +489,7 @@ class QualAnalyzerV20:
             print(f"Click Error: {e}")
 
     def plot_corr_scatter(self, px, py):
-        """Draw the detailed regression plot."""
+        """Draw the detailed regression plot on the right panel."""
         try:
             if self.corr_scatter_canvas is None:
                 self.corr_fig_scatter = plt.Figure(figsize=(5, 5), dpi=100)
@@ -432,23 +503,34 @@ class QualAnalyzerV20:
             data = self.current_corr_raw_data[[px, py]].dropna()
             r_val = self.current_corr_df.loc[px, py]
 
-            sns.regplot(
-                data=data,
-                x=px,
-                y=py,
-                ax=ax,
-                scatter_kws={'alpha': 0.5, 's': 30, 'edgecolor': 'black'},
-                line_kws={'color': 'red'}
-            )
+            sns.regplot(data=data, x=px, y=py, ax=ax,
+                        scatter_kws={'alpha': 0.5, 's': 30, 'edgecolor': 'black'}, line_kws={'color': 'red'})
 
-            ax.set_title(f"R = {r_val:.4f}", fontweight="bold")
-            # Truncate labels if too long
-            ax.set_xlabel(px if len(px) < 20 else px[:17] + "...")
-            ax.set_ylabel(py if len(py) < 20 else py[:17] + "...")
+            if ax.collections:
+                self._add_cursor_hover(ax.collections[0], labels=data.index)
+
+            # --- UNIT LOOKUP ---
+            def get_u(p_full):
+                # px/py are full names like "Icc (Room)"
+                for s in self.units_dict:
+                    if p_full in self.units_dict[s] and self.units_dict[s][p_full]:
+                        return self.units_dict[s][p_full]
+                return ""
+
+            ux = get_u(px)
+            uy = get_u(py)
+
+            # Label
+            lbl_x = f"{px} ({ux})" if ux else px
+            lbl_y = f"{py} ({uy})" if uy else py
+
+            # Truncate if extremely long
+            ax.set_xlabel(lbl_x if len(lbl_x) < 25 else lbl_x[:22] + "...")
+            ax.set_ylabel(lbl_y if len(lbl_y) < 25 else lbl_y[:22] + "...")
+
+            ax.set_title(f"Relationship Detail\nR = {r_val:.4f}", fontweight="bold")
             ax.grid(True, alpha=0.3)
-
-            ax.text(0.05, 0.95, f"N = {len(data)}", transform=ax.transAxes,
-                    bbox=dict(facecolor='white', alpha=0.8))
+            ax.text(0.05, 0.95, f"N = {len(data)}", transform=ax.transAxes, bbox=dict(facecolor='white', alpha=0.8))
 
             self.corr_fig_scatter.tight_layout()
             self.corr_scatter_canvas.draw()
@@ -477,7 +559,7 @@ class QualAnalyzerV20:
         self.combo_cpk_mode.bind("<<ComboboxSelected>>", lambda e: self.plot_cpk_viz())
         # ------------------------------------------
 
-        paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        paned = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
         self.cpk_plot_frame = ttk.Frame(paned)
@@ -502,6 +584,7 @@ class QualAnalyzerV20:
         self.lbl_fail_summary = ttk.Label(frame, text="Total Failures: 0", font=("Arial", 12, "bold"))
         self.lbl_fail_summary.pack(in_=top, side=tk.LEFT, pady=10, padx=5)
         ttk.Button(top, text="Export Failures to CSV", command=self.export_failures_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top, text="Pareto by Bin (Smart Decode)", command=self.plot_bin_pareto).pack(side=tk.LEFT, padx=5)
 
         cols = ("Sheet", "SN", "Parameter", "Value", "LSL", "USL", "Type")
         self.tree_fail = ttk.Treeview(frame, columns=cols, show="headings")
@@ -519,25 +602,44 @@ class QualAnalyzerV20:
         # Top Control Bar
         top = ttk.Frame(frame, padding=5)
         top.pack(fill=tk.X)
-        ttk.Button(top, text="Run Multivariate Assessment", command=self.calculate_assessment).pack(side=tk.LEFT,
-                                                                                                    padx=5)
-        ttk.Button(top, text="Export Assessment CSV", command=self.export_assessment_csv).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(top, text="(Click any dot in the plot to see WHY it is an outlier)",
-                  font=("Arial", 9, "italic")).pack(side=tk.LEFT, padx=15)
+        # Sheet Selector
+        ttk.Label(top, text="Select Test Step:").pack(side=tk.LEFT, padx=(5, 2))
+        self.combo_assess_sheet = ttk.Combobox(top, state="readonly", width=20)
+        self.combo_assess_sheet.pack(side=tk.LEFT, padx=5)
 
-        # Main Split: Top (Table + Plot) vs Bottom (Contribution Analysis)
-        main_paned = ttk.PanedWindow(frame, orient=tk.VERTICAL)
+        def update_sheet_values():
+            if self.data_dict:
+                vals = list(self.data_dict.keys())
+                self.combo_assess_sheet['values'] = ["All Combined"] + vals
+
+        self.combo_assess_sheet.bind('<Button-1>', lambda e: update_sheet_values())
+        self.combo_assess_sheet.set("All Combined")
+
+        # Buttons
+        ttk.Button(top, text="Run Outlier Assessment", command=self.calculate_assessment).pack(side=tk.LEFT, padx=15)
+
+        # --- NEW BUTTON ---
+        ttk.Button(top, text="Analyze Stress & Wearout", command=self.run_stress_analysis).pack(side=tk.LEFT, padx=5)
+        # ------------------
+
+        ttk.Button(top, text="Export CSV", command=self.export_assessment_csv).pack(side=tk.LEFT, padx=15)
+
+        ttk.Label(top, text="(Click outlier in plot to analyze root cause)", font=("Arial", 9, "italic")).pack(
+            side=tk.LEFT, padx=15)
+
+        # Main Split
+        main_paned = ttk.Panedwindow(frame, orient=tk.VERTICAL)
         main_paned.pack(fill=tk.BOTH, expand=True, pady=5)
 
         top_pane = ttk.Frame(main_paned)
-        self.bottom_pane = ttk.Frame(main_paned)  # For Contribution Plot
+        self.bottom_pane = ttk.Frame(main_paned)
 
         main_paned.add(top_pane, weight=3)
         main_paned.add(self.bottom_pane, weight=2)
 
-        # Top Split: Table (Left) vs Scatter (Right)
-        sub_paned = ttk.PanedWindow(top_pane, orient=tk.HORIZONTAL)
+        # Top Split
+        sub_paned = ttk.Panedwindow(top_pane, orient=tk.HORIZONTAL)
         sub_paned.pack(fill=tk.BOTH, expand=True)
 
         left_pane = ttk.Frame(sub_paned)
@@ -545,7 +647,7 @@ class QualAnalyzerV20:
         sub_paned.add(left_pane, weight=1)
         sub_paned.add(right_pane, weight=2)
 
-        # --- Table Setup ---
+        # Table
         self.txt_assess = tk.Text(left_pane, height=8, font=("Consolas", 9))
         self.txt_assess.pack(fill=tk.X, padx=5, pady=5)
 
@@ -561,21 +663,19 @@ class QualAnalyzerV20:
         self.tree_rank.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # --- Assessment Scatter Setup ---
+        # Scatter
         self.assess_fig = plt.Figure(figsize=(6, 4), dpi=100)
         self.assess_canvas = FigureCanvasTkAgg(self.assess_fig, master=right_pane)
         self.assess_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        # CRITICAL: Bind the click
         self.assess_canvas.mpl_connect('button_press_event', self.on_assess_click)
 
-        # --- Bottom Pane: Contribution Plot Setup ---
+        # Bottom
         self.contrib_fig = plt.Figure(figsize=(8, 3), dpi=100)
         self.contrib_canvas = FigureCanvasTkAgg(self.contrib_fig, master=self.bottom_pane)
         self.contrib_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Placeholder text
         ax = self.contrib_fig.add_subplot(111)
-        ax.text(0.5, 0.5, "Click a unit in the scatter plot above to analyze its drivers.",
+        ax.text(0.5, 0.5, "Click a unit above (Outlier Analysis) or 'Analyze Stress' for Global Trends.",
                 ha='center', va='center', color='gray')
         ax.axis('off')
 
@@ -638,10 +738,46 @@ class QualAnalyzerV20:
         ttk.Label(ctrl_frame, text="(Generates a multi-page PDF with charts, tables, and outlier analysis)",
                   font=("Arial", 9, "italic")).pack(pady=(0, 10))
 
+        # --- NEW: Interactive HTML Button ---
+        btn_html = ttk.Button(
+            ctrl_frame,
+            text="Generate Interactive HTML Report (Plotly)",
+            command=self.generate_html_report,
+            bootstyle="info"  # If using ttkbootstrap, else remove bootstyle
+        )
+        btn_html.pack(pady=5, ipadx=10, ipady=5)
+
+        ttk.Label(ctrl_frame, text="(Generates a self-contained HTML file with zoomable/hoverable charts)",
+                  font=("Arial", 9, "italic")).pack(pady=(0, 10))
+
+        btn_universal = ttk.Button(
+            ctrl_frame,
+            text="Generate Universal Data Explorer (All Params)",
+            command=self.generate_universal_explorer,
+            bootstyle="primary"
+        )
+        btn_universal.pack(pady=5, ipadx=10, ipady=5)
+
+        ttk.Label(ctrl_frame, text="(Creates a massive chart with a dropdown for every single parameter)",
+                  font=("Arial", 9, "italic")).pack(pady=(0, 10))
+
         ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
 
         # --- Section 2: On-Screen Report (Original Functionality) ---
         ttk.Label(frame, text="Quick Screen Report", font=("Arial", 10, "bold")).pack(pady=(10, 2))
+
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
+
+        btn_dash = ttk.Button(
+            ctrl_frame,
+            text="Launch Live Dashboard",  # Updated Text
+            command=self.launch_internal_dashboard,  # Updated Command
+            bootstyle="warning"
+        )
+        btn_dash.pack(pady=5, ipadx=10, ipady=5)
+
+        ttk.Label(ctrl_frame, text="(Creates a 'app.py' with scientific charts & cross-filtering)",
+                  font=("Arial", 9, "italic")).pack(pady=(0, 10))
 
         ttk.Button(frame, text="Generate Screen Report", command=self.generate_screen_report).pack(pady=5)
 
@@ -717,6 +853,12 @@ class QualAnalyzerV20:
                 line_kws={'color': 'red'}
             )
 
+            # regplot creates a scatter collection (dots) and a line (regression).
+            # The dots are usually collections[0].
+            if ax.collections:
+                # 'data' is the dataframe subset. The index should be the SNs.
+                self._add_cursor_hover(ax.collections[0], labels=data.index)
+
             ax.set_title(f"Relationship Detail\nR = {r_val:.4f}", fontweight="bold")
             ax.set_xlabel(px)
             ax.set_ylabel(py)
@@ -733,63 +875,117 @@ class QualAnalyzerV20:
 
     # ----------------- Structure detection -----------------
     def _detect_struct(self, df):
-        col0 = df.iloc[:, 0].astype(str).str.strip()
-        col0_lower = col0.str.lower()
+        """
+        Structure Detection V15 (Decoupled Bin Search):
+        1. Condition Row = Row with most '=' signs.
+        2. Header Row = Row with most text chars in first 5 cols.
+        3. Unit Row = Row with most unit keywords.
+        4. Limits = Look for 'Max'/'Min'.
+        5. BIN COLUMN = Independent scan of first 20 rows/10 cols.
+        """
+        scan_depth = min(50, len(df))
+        df_search = df.iloc[:scan_depth].fillna("").astype(str)
 
-        # Data start
-        start = 18
-        for i in range(len(col0_lower) - 1):
-            if col0_lower.iloc[i] in ["1", "1.0"] and col0_lower.iloc[i + 1] in ["2", "2.0"]:
-                start = i
-                break
-        self.var_data_start.set(start)
+        # --- 1. FIND TEST CONDITION ROW (Highest '=' Count) ---
+        cond_row = -1
+        max_equals = 0
+        for i in range(scan_depth):
+            row_text = "".join(df_search.iloc[i].values)
+            equals_count = row_text.count("=")
+            if equals_count > max_equals:
+                max_equals = equals_count
+                cond_row = i
 
-        # Data end
-        end = len(df) - 1
-        for i in range(start, len(col0_lower)):
-            if col0_lower.iloc[i] in ["nan", "none", ""]:
-                end = i - 1
-                break
-        self.var_data_end.set(end)
+        if cond_row == -1: cond_row = 6
+        self.var_cond_row.set(cond_row)
 
-        search_top = max(0, start - 25)
-        search_slice = col0_lower.iloc[search_top:start]
+        # --- 2. FIND HEADER ROW (Most Text, No '=') ---
+        header_row = 5
+        max_chars = 0
+        for i in range(scan_depth):
+            if i == cond_row: continue
 
-        def find_best_row(patterns_include, patterns_exclude=()):
-            mask = search_slice.apply(
-                lambda s: any(p in s for p in patterns_include) and not any(e in s for e in patterns_exclude)
-            )
-            idx = np.where(mask.to_numpy())[0]
-            if len(idx):
-                return search_top + int(idx[-1])
-            return None
+            cols_to_check = df_search.iloc[i, 0:6].values
+            row_text = "".join(cols_to_check)
 
-        max_row = find_best_row(
-            ["max limit", "upper limit", "usl"],
-            ["max reading", "maximum reading"],
-        )
-        min_row = find_best_row(
-            ["min limit", "lower limit", "lsl"],
-            ["min reading", "minimum reading"],
-        )
+            if "=" in row_text: continue
+            if "job" in row_text.lower() or "part" in row_text.lower(): continue
 
-        if max_row is None or min_row is None:
-            u, l = 12, 13
-            for i in range(search_top, start):
-                t = col0_lower.iloc[i]
-                if "max" in t and "reading" not in t:
-                    u = i
-                elif "min" in t and "reading" not in t:
-                    l = i
-            if max_row is None:
-                max_row = u
-            if min_row is None:
-                min_row = l
+            char_count = sum(c.isalpha() for c in row_text)
+            if char_count > max_chars:
+                max_chars = char_count
+                header_row = i
 
-        self.var_usl_row.set(max_row)
-        self.var_lsl_row.set(min_row)
-        header_row = max(min(max_row, min_row) - 1, 0)
         self.var_header_row.set(header_row)
+
+        # --- 3. FIND UNIT ROW ---
+        unit_row = -1
+        max_unit_score = 0
+        known_units = {"v", "mv", "uv", "a", "ma", "ua", "na", "ns", "us", "ms", "s", "mhz", "khz", "hz", "ohm", "kohm",
+                       "c", "f"}
+
+        for i in range(scan_depth):
+            if i == header_row or i == cond_row: continue
+
+            row_vals = [str(x).lower().strip() for x in df.iloc[i]]
+            score = sum(1 for x in row_vals if x in known_units)
+            if score > max_unit_score:
+                max_unit_score = score
+                unit_row = i
+
+        if unit_row == -1: unit_row = max(header_row + 1, cond_row + 1)
+        self.var_unit_row.set(unit_row)
+
+        # --- 4. FIND LIMITS ---
+        usl_row = -1
+        lsl_row = -1
+        for i in range(header_row + 1, scan_depth):
+            val_col0 = str(df.iloc[i, 0]).lower().strip()
+
+            if "max" in val_col0 and "limit" in val_col0:
+                usl_row = i
+            elif "maximum" in val_col0:
+                usl_row = i
+
+            if "min" in val_col0 and "limit" in val_col0:
+                lsl_row = i
+            elif "minimum" in val_col0:
+                lsl_row = i
+
+        if usl_row == -1: usl_row = unit_row + 1
+        if lsl_row == -1: lsl_row = unit_row + 2
+        self.var_usl_row.set(usl_row)
+        self.var_lsl_row.set(lsl_row)
+
+        # --- 5. FIND DATA START ---
+        start_search = max(usl_row, lsl_row, unit_row, cond_row) + 1
+        data_start = start_search
+        for i in range(start_search, scan_depth + 50):
+            if i >= len(df): break
+            val = str(df.iloc[i, 0]).strip()
+            if val in ["1", "1.0", "TS1"]:
+                data_start = i
+                break
+        self.var_data_start.set(data_start)
+        self.var_data_end.set(len(df) - 1)
+
+        # --- 6. FIND BIN COLUMN (INDEPENDENT SEARCH) ---
+        # Scan first 20 rows and first 10 columns for "BIN"
+        bin_col = -1
+        search_rows = min(20, len(df))
+        search_cols = min(10, df.shape[1])
+
+        found = False
+        for r in range(search_rows):
+            if found: break
+            for c in range(search_cols):
+                val = str(df.iloc[r, c]).lower().strip()
+                if val == "bin" or val == "hbin" or val == "hard bin":
+                    bin_col = c
+                    found = True
+                    break
+
+        self.var_bin_col.set(bin_col)
 
     # ----------------- File loading / parsing -----------------
     def load_file(self):
@@ -797,111 +993,257 @@ class QualAnalyzerV20:
         if not f:
             return
         self.current_file = f
-        self._load_from_path(f)
+        self._start_loading_thread(f)
 
     def reload_last_file(self):
-        if not self.current_file or not os.path.isfile(self.current_file):
+        if not self.current_file or not os.path.exists(self.current_file):
             messagebox.showinfo("Info", "No previous file found.")
             return
-        self._load_from_path(self.current_file)
+        self._start_loading_thread(self.current_file)
 
-    def _load_from_path(self, path):
-        self.lbl_status.config(text=f"Loading: {os.path.basename(path)}")
-        self.root.update()
+    def _start_loading_thread(self, path):
+        """
+        1. UI SETUP: Locks the UI and starts the progress bar.
+        """
+        self.lbl_status.config(text=f"Loading: {os.path.basename(path)}... Please Wait.")
+
+        # Show and start progress bar
+        self.progress.pack(side=tk.LEFT, padx=5)
+        self.progress.start(10)  # Move bar every 10ms
+
+        # Disable buttons so user doesn't click 'Load' again while loading
+        self.root.update_idletasks()
+
+        # Start the background thread
+        # daemon=True means this thread will die if you close the main window
+        threading.Thread(target=self._load_worker, args=(path,), daemon=True).start()
+
+    def _load_worker(self, path):
+        """
+        2. BACKGROUND WORK: Reads the file. NO UI CODE ALLOWED HERE.
+        """
         try:
             xls = pd.ExcelFile(path)
-            self.raw_previews = {
-                s: pd.read_excel(xls, sheet_name=s, header=None, engine="openpyxl")
+
+            # Read all sheets (Heavy I/O Operation)
+            # We create a local dictionary first, then pass it back
+            previews = {
+                s: pd.read_excel(xls, sheet_name=s, header=None)
                 for s in xls.sheet_names
             }
+
             if not xls.sheet_names:
                 raise ValueError("Workbook has no sheets.")
 
-            df0 = self.raw_previews[xls.sheet_names[0]]
-            self._detect_struct(df0)
+            # Pass success results back to Main Thread
+            # self.root.after(0, func, *args) schedules 'func' to run on the main thread ASAP
+            self.root.after(0, self._finish_loading, previews, xls.sheet_names, None)
 
-            self.combo_inspect_sheet["values"] = xls.sheet_names
-            if xls.sheet_names:
-                self.combo_inspect_sheet.current(0)
-
-            self.reparse_file()
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            # Pass error back to Main Thread
+            self.root.after(0, self._finish_loading, None, None, str(e))
+
+    def _finish_loading(self, new_previews, sheet_names, error_msg):
+        """
+        3. CLEANUP: Updates UI and parses data. Runs on Main Thread.
+        """
+        # Stop and hide progress bar
+        self.progress.stop()
+        self.progress.pack_forget()
+
+        if error_msg:
             self.lbl_status.config(text="Error during load.")
+            messagebox.showerror("Load Error", error_msg)
+            return
+
+        # Update Class Data
+        self.raw_previews = new_previews
+        self.combo_inspect_sheet["values"] = sheet_names
+
+        # Run detection logic on the first sheet
+        if sheet_names:
+            self.combo_inspect_sheet.current(0)
+            self._detect_struct(self.raw_previews[sheet_names[0]])
+
+        # Continue with the parsing (which is fast enough to keep on main thread)
+        self.reparse_file()
+        self.lbl_status.config(text="File Loaded Successfully.")
 
     def reparse_file(self):
+        """
+        Robust Parsing V2:
+        1. Identifies and creates "Error Code" failures for values >= Magic Number (e.g., 9999).
+           These are removed from the population stats (set to NaN).
+        2. Detects "Halt-on-Fail" sequences. If a unit fails param X, and subsequent params are 0 or NaN,
+           they are marked as "Skipped" (NaN) so they don't skew the mean as '0.0'.
+        """
         if not self.current_file:
             return
-        self.page_size = max(10, self.var_page_size.get() or 100)
 
-        h, u, l = self.var_header_row.get(), self.var_usl_row.get(), self.var_lsl_row.get()
+        # 1. Config Retrieval
+        self.page_size = max(10, self.var_page_size.get() or 100)
+        h = self.var_header_row.get()
+        u_row = self.var_unit_row.get()
+        cond_r = self.var_cond_row.get()
+        u_lim_r, l_lim_r = self.var_usl_row.get(), self.var_lsl_row.get()
         d_s, d_e = self.var_data_start.get(), self.var_data_end.get()
         sn_idx = self.var_sn_col.get()
+        p_start = self.var_param_start_col.get()
+        bin_idx = self.var_bin_col.get()
 
+        # New Cleaning Configs
+        magic_val = self.var_magic_val.get()
+        clean_zeros = self.var_clean_zeros.get()
+
+        # 2. Reset Stores
         self.data_dict.clear()
+        self.units_dict.clear()
         self.limits_dict.clear()
         self.param_map.clear()
         self.failures.clear()
+        self.bin_map = {}
         self.measure_long = []
         self.limit_long = []
 
         try:
             for sheet, raw in self.raw_previews.items():
-                if h >= len(raw):
-                    continue
+                if h >= len(raw): continue
 
+                # --- HEADER & UNITS ---
                 raw_header = raw.iloc[h].values
                 clean_header = self._process_headers(raw_header)
 
-                usls = pd.to_numeric(raw.iloc[u].values, errors="coerce") if u < len(raw) else []
-                lsls = pd.to_numeric(raw.iloc[l].values, errors="coerce") if l < len(raw) else []
+                sheet_units = {}
+                if u_row < len(raw):
+                    raw_units = raw.iloc[u_row].values
+                    for idx, param in enumerate(clean_header):
+                        if idx < len(raw_units):
+                            val = str(raw_units[idx]).strip()
+                            if val and val.lower() != "nan":
+                                sheet_units[param] = val
+                self.units_dict[sheet] = sheet_units
 
+                # --- LIMITS ---
+                usls = pd.to_numeric(raw.iloc[u_lim_r].values, errors="coerce") if u_lim_r < len(raw) else []
+                lsls = pd.to_numeric(raw.iloc[l_lim_r].values, errors="coerce") if l_lim_r < len(raw) else []
+
+                # --- DATA SLICING ---
                 e = d_e if d_e > d_s else len(raw) - 1
                 e = min(e, len(raw) - 1)
-                df = raw.iloc[d_s : e + 1, :].copy()
+                df = raw.iloc[d_s: e + 1, :].copy()
 
+                # Align & Rename
                 valid = min(len(clean_header), df.shape[1])
                 df = df.iloc[:, :valid]
-
                 col_names = list(clean_header[:valid])
-                if sn_idx < len(col_names):
-                    col_names[sn_idx] = "SN"
+                if sn_idx < len(col_names): col_names[sn_idx] = "SN"
                 df.columns = col_names
 
+                # Basic Cleaning
                 df = df.dropna(subset=["SN"], how="all")
                 df["SN"] = df["SN"].astype(str)
 
+                # --- PRE-PROCESSING: Convert to Numeric ---
+                # We do this on the whole DF first to enable vectorized logic
+                numeric_cols = []
                 for c in df.columns:
-                    if c != "SN":
+                    if c != "SN" and c != "BIN":  # Skip non-measurements
                         df[c] = pd.to_numeric(df[c], errors="coerce")
+                        numeric_cols.append(c)
 
-                self.data_dict[sheet] = df
+                # --- ROBUST LOGIC 1: MAGIC NUMBER (ERROR CODE) REMOVAL ---
+                # Strategy: Identify them, log them as failures, then Nuke them from stats.
+                # We treat anything >= magic_val (absolute) as an error code.
+                if numeric_cols:
+                    # Create a boolean mask of error codes
+                    error_mask = df[numeric_cols].abs() >= (magic_val - 0.0001)  # Tolerance for floats
 
+                    if error_mask.any().any():
+                        # Extract the errors to add to failure list
+                        err_rows, err_cols = np.where(error_mask)
+                        for r, c in zip(err_rows, err_cols):
+                            sn_val = df.iloc[r]["SN"]
+                            param_name = numeric_cols[c]
+                            bad_val = df.iloc[r][param_name]
+
+                            # Add to failures immediately
+                            # We don't have limits for this specific param yet, but we know it's an error code
+                            self.failures.append({
+                                "Sheet": sheet,
+                                "SN": sn_val,
+                                "Bin": "Error",  # Placeholder, updated later
+                                "Parameter": param_name,
+                                "Value": bad_val,
+                                "LSL": np.nan,
+                                "USL": np.nan,
+                                "Type": "Error_Code"  # Special type
+                            })
+
+                        # CRITICAL: Replace magic numbers with NaN so they don't skew Mean/Std/Cpk
+                        df[numeric_cols] = df[numeric_cols].mask(error_mask, np.nan)
+
+                # --- ROBUST LOGIC 2: HALT-ON-FAIL (TRAILING ZEROS) ---
+                # If a unit fails Param A, and Param B (which comes later) is 0.0, it's likely a skip.
+                # This is complex because we need to know Limits to know if it failed Param A.
+
+                # A. Build Limits Map First
                 s_lims = {}
-                for i, p in enumerate(clean_header[:valid]):
-                    if i == sn_idx:
-                        continue
-                    if p not in df.columns:
-                        continue
+                col_indices = {}  # Map param name -> column index
 
-                    base = self._get_base(p)
-                    if base not in self.param_map:
-                        self.param_map[base] = []
-                    if sheet not in self.param_map[base]:
-                        self.param_map[base].append(sheet)
+                for i, p in enumerate(col_names):
+                    if i < p_start or i == sn_idx or i == bin_idx: continue
+                    if p not in df.columns: continue
 
                     uv = usls[i] if i < len(usls) else np.nan
                     lv = lsls[i] if i < len(lsls) else np.nan
                     s_lims[p] = (lv, uv)
+                    col_indices[p] = i
 
-                    self.limit_long.append(
-                        {"Sheet": sheet, "Parameter": p, "LSL": lv, "USL": uv}
-                    )
+                    # Store standard limit structures
+                    base = self._get_base(p)
+                    if base not in self.param_map: self.param_map[base] = []
+                    if sheet not in self.param_map[base]: self.param_map[base].append(sheet)
+                    self.limits_dict[sheet] = s_lims
+                    self.limit_long.append({"Sheet": sheet, "Parameter": p, "LSL": lv, "USL": uv})
 
-                self.limits_dict[sheet] = s_lims
+                # B. Execute Halt-on-Fail Cleaning
+                if clean_zeros and numeric_cols:
+                    # iterate rows (units)
+                    for idx in df.index:
+                        has_failed = False
 
-                value_cols = [c for c in df.columns if c != "SN"]
-                melted = df.melt(id_vars=["SN"], value_vars=value_cols, var_name="Parameter", value_name="Value")
+                        # Iterate columns in order of test
+                        for col in numeric_cols:
+                            val = df.at[idx, col]
+
+                            # If we already failed a previous test, and this value is 0 or NaN, scrub it
+                            if has_failed:
+                                if pd.isna(val) or val == 0.0:
+                                    df.at[idx, col] = np.nan
+                                    continue  # Skip failure check for this scrubbed value
+
+                            # Check if THIS test is a failure
+                            if col in s_lims and not pd.isna(val):
+                                l, u = s_lims[col]
+                                if (not pd.isna(l) and val < l) or (not pd.isna(u) and val > u):
+                                    has_failed = True
+
+                self.data_dict[sheet] = df
+
+                # --- BIN MAPPING ---
+                current_sheet_bins = {}
+                if bin_idx >= 0 and bin_idx < raw.shape[1]:
+                    raw_slice = raw.iloc[d_s: e + 1, :].copy()
+                    if sn_idx < raw_slice.shape[1] and bin_idx < raw_slice.shape[1]:
+                        sn_vals = raw_slice.iloc[:, sn_idx].astype(str)
+                        bin_vals = raw_slice.iloc[:, bin_idx].astype(str)
+                        current_sheet_bins = dict(zip(sn_vals, bin_vals))
+                self.bin_map[sheet] = current_sheet_bins
+
+                # --- STANDARD LONG FORMAT & FAIL DETECTION ---
+                # (Standard failure detection for normal values)
+                valid_params = list(s_lims.keys())
+                melted = df.melt(id_vars=["SN"], value_vars=valid_params, var_name="Parameter", value_name="Value")
                 melted["Sheet"] = sheet
                 self.measure_long.append(melted)
 
@@ -909,93 +1251,113 @@ class QualAnalyzerV20:
                 self.lbl_status.config(text="No data parsed.")
                 return
 
+            # 3. Finalize Dataframes
             self.measure_long = pd.concat(self.measure_long, ignore_index=True)
             self.limit_long = pd.DataFrame(self.limit_long).drop_duplicates()
 
-            merged = pd.merge(
-                self.measure_long,
-                self.limit_long,
-                on=["Sheet", "Parameter"],
-                how="left",
-            )
-
+            # Merge Data with Limits
+            merged = pd.merge(self.measure_long, self.limit_long, on=["Sheet", "Parameter"], how="left")
             for col in ["Value", "LSL", "USL"]:
                 merged[col] = pd.to_numeric(merged[col], errors='coerce')
 
+            # 4. Standard Failure Detection (Limit Check)
             merged["FailHigh"] = (~merged["USL"].isna()) & (merged["Value"] > merged["USL"])
-            merged["FailLow"]  = (~merged["LSL"].isna()) & (merged["Value"] < merged["LSL"])
-            merged["FailType"] = np.where(
-                merged["FailHigh"], "High",
-                np.where(merged["FailLow"], "Low", "")
-            )
+            merged["FailLow"] = (~merged["LSL"].isna()) & (merged["Value"] < merged["LSL"])
+            merged["FailType"] = np.where(merged["FailHigh"], "High", np.where(merged["FailLow"], "Low", ""))
 
-            self.fail_long = merged[(merged["FailHigh"] | merged["FailLow"]) & (~merged["Value"].isna())]
+            std_fails = merged[(merged["FailHigh"] | merged["FailLow"]) & (~merged["Value"].isna())]
 
-            self.failures = []
-            for _, r in self.fail_long.iterrows():
-                self.failures.append(
-                    {
-                        "Sheet": r["Sheet"],
-                        "SN": r["SN"],
-                        "Parameter": r["Parameter"],
-                        "Value": r["Value"],
-                        "LSL": r["LSL"],
-                        "USL": r["USL"],
-                        "Type": r["FailType"],
-                    }
-                )
+            # 5. Merge Special "Error Code" Failures with Standard Failures
+            # We add standard fails to the list we started in the Error Code section
+            for _, r in std_fails.iterrows():
+                self.failures.append({
+                    "Sheet": r["Sheet"],
+                    "SN": r["SN"],
+                    "Bin": "Unknown",  # Will update below
+                    "Parameter": r["Parameter"],
+                    "Value": r["Value"],
+                    "LSL": r["LSL"],
+                    "USL": r["USL"],
+                    "Type": r["FailType"],
+                })
 
+            # 6. Update Bins for all failures
+            for f in self.failures:
+                if f["Bin"] == "Error" or f["Bin"] == "Unknown":
+                    f["Bin"] = self.bin_map.get(f["Sheet"], {}).get(str(f["SN"]), "Unknown")
+
+            # 7. Refresh UI
             self.combo_trend_param["values"] = sorted(list(self.param_map.keys()))
             self.combo_param_viz["values"] = self.combo_trend_param["values"]
-
             self.current_page = 0
             self.update_inspector_grid(None)
             self.plot_cpk_viz()
             self.populate_failures()
             self.calculate_assessment()
-            self.lbl_status.config(text="Analysis Complete.")
-
+            self.lbl_status.config(text="Analysis Complete (Robust Mode).")
             if hasattr(self, 'combo_corr_sheet'):
                 self.combo_corr_sheet['values'] = list(self.data_dict.keys())
-                if self.data_dict:
-                    self.combo_corr_sheet.current(0)
+                if self.data_dict: self.combo_corr_sheet.current(0)
 
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Error", f"Parse Error: {str(e)}")
             self.lbl_status.config(text="Error during parse.")
+            import traceback
+            traceback.print_exc()
 
     # ----------------- Inspector pagination -----------------
     def update_inspector_grid(self, _event):
         sheet = self.combo_inspect_sheet.get()
-        if sheet not in self.raw_previews:
-            return
+        if sheet not in self.raw_previews: return
+
         df = self.raw_previews[sheet]
         self.total_rows = len(df)
         self.lbl_page.config(text=f"Page {self.current_page + 1}")
-        self.page_size = max(10, self.var_page_size.get() or 100)
 
+        # Clear and Setup Columns
         self.tree_raw.delete(*self.tree_raw.get_children())
         self.tree_raw["columns"] = list(range(len(df.columns)))
 
-        start = self.current_page * self.page_size
-        subset = df.iloc[start : start + self.page_size]
-
         w = int(self.var_col_width.get())
+        p_start = self.var_param_start_col.get()
+        bin_c = self.var_bin_col.get()
 
         for i in range(len(df.columns)):
-            self.tree_raw.heading(i, text=str(i))
-            # stretch=False ensures manual width is honored
+            col_text = str(i)
+            if i == p_start:
+                col_text += " [START]"
+                self.tree_raw.heading(i, text=col_text, image=self.icon_param_start, anchor="w")
+            elif i == bin_c:
+                col_text += " [BIN]"
+                self.tree_raw.heading(i, text=col_text, image="", anchor="w")
+            else:
+                self.tree_raw.heading(i, text=col_text, image="", anchor="w")
             self.tree_raw.column(i, width=w, stretch=False, anchor="w")
 
+        # Configs for Highlighting
         h = self.var_header_row.get()
-        u, l = self.var_usl_row.get(), self.var_lsl_row.get()
-        ds, de = self.var_data_start.get(), self.var_data_end.get()
+        unit_r = self.var_unit_row.get()
+        cond_r = self.var_cond_row.get()
+        u = self.var_usl_row.get()
+        l = self.var_lsl_row.get()
+        ds = self.var_data_start.get()
+        de = self.var_data_end.get()
+
+        # Paginate
+        start = self.current_page * self.page_size
+        subset = df.iloc[start: start + self.page_size]
 
         for i, row in subset.iterrows():
             vals = [str(x) if not pd.isna(x) else "" for x in row]
+
+            # --- HIGHLIGHT LOGIC ---
             tag = ""
             if i == h:
                 tag = "HEADER"
+            elif i == unit_r:
+                tag = "UNIT"  # <--- NEW
+            elif i == cond_r:
+                tag = "COND"  # <--- NEW
             elif i == u:
                 tag = "USL"
             elif i == l:
@@ -1004,10 +1366,10 @@ class QualAnalyzerV20:
                 tag = "DATA_START"
             elif de > 0 and i == de:
                 tag = "DATA_END"
+
             self.tree_raw.insert("", "end", values=vals, tags=(tag,))
 
         self._apply_inspector_row_height()
-        self.tree_raw.update_idletasks()
 
     def prev_page(self):
         if self.current_page > 0:
@@ -1149,6 +1511,10 @@ class QualAnalyzerV20:
                 linewidth=0.5
             )
 
+            # NEW CODE: ADD HOVER
+            # We want the tooltip to show the Parameter Name, not SN (since Cpk is per-param)
+            self._add_cursor_hover(sc, labels=df_p["Param"])
+
             # --- THE FIX: SYMLOG SCALE ---
             # 'linthresh=3' means: Be Linear from 0 to 3. Be Logarithmic above 3.
             # This keeps your 0-2 range perfectly readable while shrinking the 10,000 outlier.
@@ -1196,6 +1562,8 @@ class QualAnalyzerV20:
                     alpha=0.7
                 )
 
+                self._add_cursor_hover(sc, labels=df_p["Param"])
+
                 # Draw "Goal Posts"
                 ax.axvline(0.0, color="red", ls="-", label="LSL")
                 ax.axvline(1.0, color="red", ls="-", label="USL")
@@ -1217,7 +1585,6 @@ class QualAnalyzerV20:
             param = self.combo_trend_param.get()
             plot_type = self.var_trend_type.get()
 
-            # 1. Clear previous plot immediately to prevent "stale" data confusion
             if self.trend_canvas is None:
                 self.trend_fig = plt.Figure(figsize=(10, 6), dpi=100)
                 self.trend_canvas = FigureCanvasTkAgg(self.trend_fig, master=self.trend_plot_frame)
@@ -1225,43 +1592,45 @@ class QualAnalyzerV20:
             else:
                 self.trend_fig.clf()
 
-            # Force a draw now so if we return early, the user sees a blank screen (not the old plot)
-            self.trend_canvas.draw()
+            self.trend_canvas.draw()  # Clear immediately
 
-            if not param or self.measure_long is None:
-                return
+            if not param or self.measure_long is None: return
 
-            # 2. Global Definition of sheet_order (CRITICAL FIX)
-            # This must exist before any if/else blocks try to use it
             sheet_order = list(self.data_dict.keys())
 
-            # 3. Create the Base Subset (for Box/Spaghetti plots)
-            # We filter by the base parameter name to capture all temps
+            # --- UNIT LOOKUP ---
+            # Try to find the unit for this parameter from the first available sheet
+            unit_str = ""
+            for s in sheet_order:
+                # We need to reconstruct the likely full parameter name (e.g. "Icc (Room)")
+                # or check if the base name exists in the unit map
+                # The units_dict keys are the ORIGINAL parameter names.
+                # Let's search the units_dict[s] for any key containing our base param
+                if s in self.units_dict:
+                    for full_param, u_val in self.units_dict[s].items():
+                        if param in full_param and u_val:
+                            unit_str = u_val
+                            break
+                if unit_str: break
+
+            unit_label = f" ({unit_str})" if unit_str else ""
+
+            # Prepare Data
             subset = self.measure_long[
                 self.measure_long["Parameter"].apply(lambda x: self._get_base(x) == param)].copy()
+            if subset.empty: return
 
-            if subset.empty:
-                # If no data found, just exit (screen is already cleared)
-                return
-
-            # Sort subset by Sheet order
             subset["Sheet"] = subset["Sheet"].astype(str)
             subset["Sheet"] = pd.Categorical(subset["Sheet"], categories=sheet_order, ordered=True)
             subset = subset.sort_values("Sheet")
 
             ax = self.trend_fig.add_subplot(111)
 
-            # =========================================================
-            # MODE 1: Mean & Cpk Trend (Tri-Temp Robust)
-            # =========================================================
+            # --- MODE 1: Mean & Cpk ---
             if "Mean & Cpk" in plot_type:
                 ax2 = ax.twinx()
-                styles = {
-                    "Room": ("green", "o", "-"),
-                    "Cold": ("blue", "D", "--"),
-                    "Hot": ("red", "s", ":"),
-                    "Data": ("black", "x", "-.")
-                }
+                styles = {"Room": ("green", "o", "-"), "Cold": ("blue", "D", "--"), "Hot": ("red", "s", ":"),
+                          "Data": ("black", "x", "-.")}
 
                 def get_temp(p_name):
                     if "(Room)" in p_name: return "Room"
@@ -1269,17 +1638,13 @@ class QualAnalyzerV20:
                     if "(Hot)" in p_name: return "Hot"
                     return "Data"
 
-                # Find specific columns (e.g., Icc Room, Icc Hot)
                 all_params = self.measure_long["Parameter"].unique()
                 relevant_cols = [p for p in all_params if self._get_base(p) == param]
-
-                # Gather data by temp
                 temp_groups = {}
+
                 for col in relevant_cols:
                     temp = get_temp(col)
-                    if temp not in temp_groups:
-                        temp_groups[temp] = {"sheets": [], "means": [], "cpks": []}
-
+                    if temp not in temp_groups: temp_groups[temp] = {"sheets": [], "means": [], "cpks": []}
                     for s in sheet_order:
                         temp_groups[temp]["sheets"].append(s)
                         df = self.data_dict[s]
@@ -1297,69 +1662,144 @@ class QualAnalyzerV20:
                             temp_groups[temp]["means"].append(np.nan)
                             temp_groups[temp]["cpks"].append(np.nan)
 
-                # Plot
                 lines, labels = [], []
                 for temp, data in temp_groups.items():
-                    # Skip if no data
                     if all(pd.isna(x) for x in data["means"]): continue
-
                     c, mk, ls = styles.get(temp, styles["Data"])
                     l1 = ax.plot(data["sheets"], data["means"], color=c, marker=mk, ls="-", alpha=0.8,
                                  label=f"{temp} Mean")
                     l2 = ax2.plot(data["sheets"], data["cpks"], color=c, marker=mk, ls=ls, lw=1.5, alpha=0.5,
                                   label=f"{temp} Cpk")
+                    self._add_cursor_hover(l1[0], labels=data["sheets"])
                     lines.extend(l1 + l2)
                     labels.extend([l1[0].get_label(), l2[0].get_label()])
 
                 ax.set_title(f"Tri-Temp Trend: {param}")
-                ax.set_ylabel("Mean Value")
+                ax.set_ylabel(f"Mean Value{unit_label}")  # <--- Unit Added
                 ax2.set_ylabel("Cpk (Dashed)")
                 ax2.axhline(1.33, color="gray", ls="--", alpha=0.5)
-                if lines:
-                    ax.legend(lines, labels, loc='upper left', fontsize=8, ncol=2)
+                if lines: ax.legend(lines, labels, loc='upper left', fontsize=8, ncol=2)
                 ax.grid(True, alpha=0.3)
 
-            # =========================================================
-            # MODE 2: Box Plot (Spread)
-            # =========================================================
+            # --- MODE 2: Box Plot ---
             elif "Box Plot" in plot_type:
                 sns.boxplot(data=subset, x="Sheet", y="Value", hue="Sheet", legend=False, ax=ax, palette="Blues",
                             showfliers=False)
                 sns.stripplot(data=subset, x="Sheet", y="Value", ax=ax, color="black", alpha=0.3, size=2, jitter=True)
                 ax.set_title(f"Distribution Trend: {param}")
                 ax.set_xlabel("Readpoint")
+                ax.set_ylabel(f"Value{unit_label}")  # <--- Unit Added
                 ax.grid(True, axis='y', alpha=0.5)
 
-            # =========================================================
-            # MODE 3: Spaghetti Plot (Maverick Detection)
-            # =========================================================
+                # --- MODE 3: Spaghetti (Trajectory Plot) ---
+                # --- MODE 3: Spaghetti (Tri-Temp Trajectories) ---
+                # --- MODE 3: Spaghetti (Tri-Temp Interactive) ---
             elif "Spaghetti" in plot_type:
-                unique_sn = subset["SN"].nunique()
-                alpha_val = 0.5 if unique_sn < 50 else 0.1
-                sns.lineplot(data=subset, x="Sheet", y="Value", hue="SN", estimator=None, units="SN", ax=ax,
-                             palette="dark:grey", legend=False, alpha=alpha_val, lw=1)
+                # 1. Helper to categorize Temps from Parameter Name
+                def get_temp_cat(p_name):
+                    lower = p_name.lower()
+                    if "hot" in lower: return "Hot"
+                    if "cold" in lower: return "Cold"
+                    return "Room"
 
-                # Highlight Mean
-                sns.lineplot(data=subset, x="Sheet", y="Value", ax=ax, color="red", lw=3, errorbar=None, label="Mean")
-                ax.set_title(f"Individual Unit Trajectories (N={unique_sn})")
-                ax.set_xlabel("Readpoint")
-                ax.legend(loc='upper right')
+                subset["Temp"] = subset["Parameter"].apply(get_temp_cat)
 
-            # =========================================================
-            # MODE 4: Drift Analysis (Robust)
-            # =========================================================
+                # 2. X-Axis Alignment
+                unique_sheets = subset["Sheet"].unique()
+                unique_sheets = sorted(unique_sheets, key=lambda s: sheet_order.index(s))
+
+                # 3. Pivot Data: Index=[SN, Temp], Columns=[Sheet]
+                # This organizes data so we have one row per "Trace"
+                pivoted = subset.pivot_table(index=["SN", "Temp"], columns="Sheet", values="Value")
+                pivoted = pivoted.reindex(columns=unique_sheets)
+
+                # 4. Identify Worst Offenders (by Serial Number)
+                # We calculate the max drift for each SN across ALL its temperatures
+                # This ensures if SN 123 is bad at Hot, we highlight SN 123 at Room/Cold too.
+                drift_per_sn_temp = pivoted.max(axis=1) - pivoted.min(axis=1)
+
+                # Group by SN to find the max drift that SN experienced in ANY temp
+                max_drift_per_sn = drift_per_sn_temp.groupby(level="SN").max()
+
+                # Pick Top 5 SNs
+                top_5_sns = max_drift_per_sn.nlargest(5).index.tolist()
+
+                # 5. Plotting Setup
+                x_idxs = range(len(unique_sheets))
+                # Requested Colors
+                temp_colors = {"Cold": "blue", "Room": "gray", "Hot": "orange"}
+
+                # Split Population vs. Worst Offenders
+                # We do this to plot the "Background" first (so it doesn't cover the important stuff)
+                df_background = pivoted[~pivoted.index.get_level_values("SN").isin(top_5_sns)]
+                df_focus = pivoted[pivoted.index.get_level_values("SN").isin(top_5_sns)]
+
+                # A. Plot Background (Population) - Faint
+                # We plot these in batches by color for performance
+                for t, color in temp_colors.items():
+                    # Extract just the rows for this temp
+                    rows = df_background[df_background.index.get_level_values('Temp') == t]
+                    if not rows.empty:
+                        # Alpha 0.1 makes the "fog" of data
+                        ax.plot(x_idxs, rows.T.values, color=color, alpha=0.15, linewidth=0.8, zorder=1)
+
+                # B. Plot Top 5 SNs (Focus) - Bold & Interactive
+                # We plot these one by one to attach distinct labels for the legend/hover
+                focus_lines = []  # Store artists for cursor
+
+                for (sn, temp), row_data in df_focus.iterrows():
+                    if row_data.notna().any():
+                        color = temp_colors.get(temp, "black")
+                        # Highlighting logic
+                        lbl = f"SN {sn} ({temp})"
+
+                        # Plot the line
+                        line, = ax.plot(x_idxs, row_data.values, color=color,
+                                        alpha=1.0, linewidth=2.0, marker='o', markersize=3,
+                                        zorder=3, label=lbl)
+                        focus_lines.append(line)
+
+                # 6. Formatting & Legend
+                ax.set_xticks(x_idxs)
+                ax.set_xticklabels(unique_sheets, rotation=45, ha='right')
+                ax.set_title(f"Unit Trajectories: {param}\n(Top 5 Drifters Highlighted at All Temps)",
+                             fontweight="bold")
+                ax.set_ylabel(f"Value{unit_label}")
+                ax.grid(True, alpha=0.3)
+
+                # Custom Legend for Colors
+                from matplotlib.lines import Line2D
+                custom_lines = [
+                    Line2D([0], [0], color='blue', lw=2),
+                    Line2D([0], [0], color='gray', lw=2),
+                    Line2D([0], [0], color='orange', lw=2)
+                ]
+                # Add the color legend + a note about bold lines
+                leg = ax.legend(custom_lines, ['Cold', 'Room', 'Hot'], loc='upper left', title="Temp Key")
+                ax.add_artist(leg)
+
+                # 7. Add Interactivity (Hover)
+                # We only attach cursors to the Focus Lines to prevent lag from 1000s of background lines
+                if focus_lines:
+                    cursor = mplcursors.cursor(focus_lines, hover=True)
+
+                    @cursor.connect("add")
+                    def on_add(sel):
+                        # sel.artist.get_label() retrieves the "SN 123 (Hot)" label we set above
+                        sel.annotation.set_text(sel.artist.get_label())
+                        sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
+
+            # --- MODE 4: Drift ---
             elif "Drift" in plot_type:
-                # Identify correct columns (Room/Cold/Hot) for this param
                 all_params = self.measure_long["Parameter"].unique()
                 relevant_cols = [p for p in all_params if self._get_base(p) == param]
                 drift_subset = self.measure_long[self.measure_long["Parameter"].isin(relevant_cols)].copy()
-
                 if drift_subset.empty: return
 
                 drift_subset["Sheet"] = drift_subset["Sheet"].astype(str)
                 pivoted = drift_subset.pivot_table(index="SN", columns="Sheet", values="Value", aggfunc='first')
-
                 valid_sheets = [s for s in sheet_order if s in pivoted.columns]
+
                 if len(valid_sheets) < 2:
                     ax.text(0.5, 0.5, "Insufficient timepoints for drift analysis", ha='center')
                 else:
@@ -1380,226 +1820,123 @@ class QualAnalyzerV20:
                              label="Cumulative Mean Drift")
 
                     ax.set_title(f"Step-by-Step vs Cumulative Drift: {param}")
-                    ax.set_ylabel("Incremental Drift (Step N - N-1)")
-                    ax2.set_ylabel("Total Mean Drift (vs T0)", color="purple")
+                    ax.set_ylabel(f"Incremental Drift{unit_label}")  # <--- Unit Added
+                    ax2.set_ylabel(f"Total Mean Drift{unit_label}", color="purple")  # <--- Unit Added
                     ax2.tick_params(axis='y', labelcolor="purple")
                     ax2.legend(loc='upper left')
                     ax.grid(True, alpha=0.3)
 
-            # =========================================================
-            # MODE 5: Shift Scatter (Headroom Analysis)
-            # =========================================================
+            # --- MODE 5: Shift Scatter ---
             elif "Shift Scatter" in plot_type:
-                # 1. Pivot Data to get Columns = Readpoints
                 all_params = self.measure_long["Parameter"].unique()
                 relevant_cols = [p for p in all_params if self._get_base(p) == param]
                 shift_subset = self.measure_long[self.measure_long["Parameter"].isin(relevant_cols)].copy()
-
                 if shift_subset.empty: return
 
                 shift_subset["Sheet"] = shift_subset["Sheet"].astype(str)
-                # Pivot: Index=SN, Columns=Sheet, Values=Value
                 pivoted = shift_subset.pivot_table(index="SN", columns="Sheet", values="Value", aggfunc='first')
-
-                # Filter to valid chronological sheets
                 valid_sheets = [s for s in sheet_order if s in pivoted.columns]
+
                 if len(valid_sheets) < 2:
-                    ax.text(0.5, 0.5, "Need at least 2 readpoints (Initial & Final) to plot shift.", ha='center')
+                    ax.text(0.5, 0.5, "Need at least 2 readpoints", ha='center')
                     self.trend_canvas.draw()
                     return
 
-                # 2. Define Initial (T0) and Final (Tx)
-                # We compare the FIRST recorded step vs the LAST recorded step
                 col_initial = valid_sheets[0]
                 col_final = valid_sheets[-1]
-
                 data_x = pivoted[col_initial]
                 data_y = pivoted[col_final]
 
-                # 3. Get Limits (for the "Box")
-                # We try to find limits from the Final sheet first
-                l, u = self.limits_dict[col_final].get(param, (np.nan, np.nan))
-                # If specific param name fails, try searching the 'relevant_cols' list for a match
-                if pd.isna(l) and pd.isna(u):
-                    # Try to grab limits from the first variant found
-                    for c in relevant_cols:
-                        tl, tu = self.limits_dict[col_final].get(c, (np.nan, np.nan))
-                        if not pd.isna(tl): l, u = tl, tu; break
-
-                # 4. Plotting
-                # Plot the Identity Line (No Drift)
+                # Plot
                 min_val = min(data_x.min(), data_y.min())
                 max_val = max(data_x.max(), data_y.max())
+                span = max_val - min_val if max_val != min_val else 0.1
 
-                # Add 5% buffer for visuals
-                span = max_val - min_val
-                if span == 0: span = 0.1
-                plot_min = min_val - span * 0.1
-                plot_max = max_val + span * 0.1
+                ax.plot([min_val - span, max_val + span], [min_val - span, max_val + span], color='gray',
+                        linestyle='--', alpha=0.5)
 
-                # Reference Line (y=x)
-                ax.plot([plot_min, plot_max], [plot_min, plot_max], color='gray', linestyle='--', alpha=0.5,
-                        label="No Drift (y=x)")
-
-                # Scatter Points
-                # Color code: Drift Up (Red), Drift Down (Blue)
                 drift = data_y - data_x
                 colors = ['#d62728' if d > 0 else '#1f77b4' for d in drift]
+                sc = ax.scatter(data_x, data_y, c=colors, edgecolors='black', alpha=0.7, s=40)
+                self._add_cursor_hover(sc, labels=data_x.index)
 
-                scatter = ax.scatter(data_x, data_y, c=colors, edgecolors='black', alpha=0.7, s=40)
-
-                # 5. Draw the "Spec Box" (if limits exist)
-                if not pd.isna(l):
-                    ax.axvline(l, color='red', linestyle='-', linewidth=1)  # Initial LSL
-                    ax.axhline(l, color='red', linestyle='-', linewidth=1)  # Final LSL
-                    ax.text(l, plot_max, "LSL", color='red', ha='right', va='top', rotation=90)
-
-                if not pd.isna(u):
-                    ax.axvline(u, color='red', linestyle='-', linewidth=1)  # Initial USL
-                    ax.axhline(u, color='red', linestyle='-', linewidth=1)  # Final USL
-                    ax.text(u, plot_min, "USL", color='red', ha='right', va='bottom', rotation=90)
-
-                # 6. Labels & Stats
                 ax.set_title(f"Shift Analysis: {col_final} vs {col_initial}", fontweight="bold")
-                ax.set_xlabel(f"Initial Value ({col_initial})")
-                ax.set_ylabel(f"Final Value ({col_final})")
-
-                # Annotate largest drifter
-                max_drift_idx = drift.abs().idxmax()
-                if not pd.isna(max_drift_idx):
-                    mx = data_x.loc[max_drift_idx]
-                    my = data_y.loc[max_drift_idx]
-                    ax.annotate(f"Max Drift: SN {max_drift_idx}",
-                                xy=(mx, my), xytext=(mx, my + span * 0.05),
-                                arrowprops=dict(facecolor='black', shrink=0.05),
-                                ha='center', fontweight='bold')
-
+                ax.set_xlabel(f"Initial Value{unit_label}")  # <--- Unit Added
+                ax.set_ylabel(f"Final Value{unit_label}")  # <--- Unit Added
                 ax.grid(True, linestyle=':', alpha=0.6)
-                ax.set_aspect('equal', adjustable='datalim')  # Square aspect ratio is crucial for y=x interpretation
+                ax.set_aspect('equal', adjustable='datalim')
 
-            # =========================================================
-            # MODE 6: Tempco Scatter (Thermal Sensitivity)
-            # =========================================================
+            # --- MODE 6: Tempco Scatter ---
             elif "Tempco Scatter" in plot_type:
-                # 1. Identify the Hot, Cold, and Room variations of this parameter
-                # We need to scan the columns of the CURRENT sheet (or T0) to find the variants
-                # Since Tempco is usually an intrinsic property, we can look at T0 (Sheet 0)
-                # or allow the user to see how Tempco changes over time (by using the current sheet).
-                # For robustness, let's calculate it for ALL sheets and use the most recent one
-                # or simply pick the first sheet where both Hot/Cold exist (Time Zero).
-
-                target_sheet = sheet_order[0]  # Default to T0 (Initial Characterization)
-
-                # Try to find the specific column names
-                # We construct the expected names based on your parser logic
-                col_room = f"{param} (Room)"
-                col_cold = f"{param} (Cold)"
-                col_hot = f"{param} (Hot)"
-
-                # Check if these exist in the dataset
-                # Note: Your parser strips brackets sometimes, or adds them.
-                # We need a robust search.
-
+                target_sheet = sheet_order[0]
                 df = self.data_dict[target_sheet].copy()
                 cols = df.columns
 
-                # Fuzzy match helper
                 def find_col(substring):
                     matches = [c for c in cols if substring.lower() in c.lower() and param.lower() in c.lower()]
-                    # Prefer exact matches of the base param + suffix
                     return matches[0] if matches else None
 
-                real_room = find_col("(Room)")
+                real_room = find_col("(Room)") or find_col("Room") or param
                 real_cold = find_col("(Cold)")
                 real_hot = find_col("(Hot)")
 
-                # Fallback: If param name itself doesn't have suffix (e.g. data was "Icc", "Icc Cold")
-                if not real_room: real_room = find_col("Room") or param  # Assume base is room?
-                if not real_cold: real_cold = find_col("Cold")
-                if not real_hot:  real_hot = find_col("Hot")
-
                 if not real_cold or not real_hot:
-                    ax.text(0.5, 0.5, f"Cannot find Hot/Cold data for '{param}'\nin sheet '{target_sheet}'",
-                            ha='center')
-                    self.trend_canvas.draw()
+                    ax.text(0.5, 0.5, f"Cannot find Hot/Cold data for '{param}'", ha='center')
+                    self.trend_canvas.draw();
                     return
 
-                # 2. Extract Data
-                # Filter out NaNs to ensure we have matched pairs
                 data = df[["SN", real_room, real_cold, real_hot]].dropna()
-
-                if data.empty:
-                    ax.text(0.5, 0.5, "No overlapping SNs with full Tri-Temp data.", ha='center')
-                    return
-
-                # 3. Calculate Tempco (Swing)
-                # We just do Delta V. If you knew degrees C, you could divide by (125 - -40).
-                # For visual outlier detection, raw Delta is sufficient and safer.
                 data["Swing"] = data[real_hot] - data[real_cold]
 
-                # 4. Plot
-                # X-Axis: Room Value (Magnitude)
-                # Y-Axis: Thermal Swing (Sensitivity)
-
-                # Color code by "Abnormal Swing"
-                # Robust Outlier Detection: Median +/- 3 * IQR
                 median_swing = data["Swing"].median()
                 iqr_swing = data["Swing"].quantile(0.75) - data["Swing"].quantile(0.25)
                 limit_upper = median_swing + 3 * iqr_swing
                 limit_lower = median_swing - 3 * iqr_swing
 
-                colors = []
-                for s in data["Swing"]:
-                    if s > limit_upper or s < limit_lower:
-                        colors.append('red')
-                    else:
-                        colors.append('teal')
+                colors = ['red' if (s > limit_upper or s < limit_lower) else 'teal' for s in data["Swing"]]
+                sc = ax.scatter(data[real_room], data["Swing"], c=colors, edgecolors='black', alpha=0.7, s=45)
+                self._add_cursor_hover(sc, labels=data["SN"])
 
-                ax.scatter(data[real_room], data["Swing"], c=colors, edgecolors='black', alpha=0.7, s=45)
-
-                # Add reference lines
-                ax.axhline(median_swing, color='gray', linestyle='--', label="Median Swing")
-                ax.axhline(limit_upper, color='red', linestyle=':', alpha=0.5, label="Statistical Limit (3*IQR)")
+                ax.axhline(median_swing, color='gray', linestyle='--')
+                ax.axhline(limit_upper, color='red', linestyle=':', alpha=0.5)
                 ax.axhline(limit_lower, color='red', linestyle=':', alpha=0.5)
 
-                ax.set_title(f"Tempco Analysis (Thermal Sensitivity)\n{param} [Hot - Cold]", fontweight="bold")
-                ax.set_xlabel(f"Room Temp Value ({real_room})")
-                ax.set_ylabel(f"Thermal Swing ({real_hot} - {real_cold})")
-
-                ax.legend()
+                ax.set_title(f"Tempco Analysis\n{param} [Hot - Cold]", fontweight="bold")
+                ax.set_xlabel(f"Room Temp Value{unit_label}")  # <--- Unit Added
+                ax.set_ylabel(f"Thermal Swing{unit_label}")  # <--- Unit Added
                 ax.grid(True, alpha=0.3)
-
-                # Annotate extreme outliers
-                outliers = data[(data["Swing"] > limit_upper) | (data["Swing"] < limit_lower)]
-                for idx, row in outliers.iterrows():
-                    ax.text(row[real_room], row["Swing"], str(row["SN"]), fontsize=8, color='darkred',
-                            fontweight='bold')
 
             self.trend_fig.tight_layout()
             self.trend_canvas.draw()
 
         except Exception as e:
-            # Catch crashes (like NameError or ValueError) and show them
-            messagebox.showerror("Plot Error", f"An error occurred while plotting:\n{str(e)}")
-            # Clear the canvas so the user knows it failed
-            if self.trend_fig:
-                self.trend_fig.clf()
-                self.trend_canvas.draw()
+            messagebox.showerror("Plot Error", f"An error occurred:\n{str(e)}")
+            if self.trend_fig: self.trend_fig.clf(); self.trend_canvas.draw()
 
     # ----------------- Distributions tab -----------------
     def plot_distribution(self):
         param = self.combo_param_viz.get()
-        if not param or self.measure_long is None:
-            return
+        if not param or self.measure_long is None: return
 
         xmode = self.var_xmode.get()
         show_limits = self.var_show_limits.get() == "On"
-
         base_param = param
+
+        # --- UNIT LOOKUP ---
+        unit_str = ""
+        # Search all sheets for this param to find unit
+        for s in self.units_dict:
+            for p, u in self.units_dict[s].items():
+                if base_param in p and u:
+                    unit_str = u;
+                    break
+            if unit_str: break
+
+        unit_lbl = f" ({unit_str})" if unit_str else ""
+
+        # Filter Data
         sub = self.measure_long[self.measure_long["Parameter"].apply(lambda p: self._get_base(p) == base_param)]
-        if sub.empty:
-            messagebox.showinfo("Info", f"No numeric data found for {param}")
-            return
+        if sub.empty: return
 
         limits_sub = self.limit_long[self.limit_long["Parameter"].isin(sub["Parameter"].unique())]
         dist_df = pd.merge(sub, limits_sub, on=["Sheet", "Parameter"], how="left")
@@ -1614,47 +1951,37 @@ class QualAnalyzerV20:
 
         def temp_of(p):
             for t in ["Room", "Cold", "Hot"]:
-                if f"({t})" in p:
-                    return t
+                if f"({t})" in p: return t
             return "Data"
 
         dist_df["Temp"] = dist_df["Parameter"].apply(temp_of)
 
+        # PLOT 1: Histogram
         if self.is_tritemp:
-            sns.histplot(
-                data=dist_df,
-                x="Value",
-                hue="Temp",
-                kde=True,
-                ax=ax1,
-                palette={"Room": "green", "Cold": "blue", "Hot": "red"},
-                multiple="layer",
-                alpha=0.5,
-            )
+            sns.histplot(data=dist_df, x="Value", hue="Temp", kde=True, ax=ax1,
+                         palette={"Room": "green", "Cold": "blue", "Hot": "red"}, multiple="layer", alpha=0.5)
             ax1.set_title(f"{base_param} Distribution by Temperature")
         else:
             sns.histplot(dist_df["Value"], kde=True, ax=ax1, color="steelblue", edgecolor="black")
             ax1.set_title(f"{base_param} Overall Distribution")
 
+        ax1.set_xlabel(f"Value{unit_lbl}")  # <--- Unit Added
+
+        # Plot Limits on Histogram
         if show_limits:
             if self.is_tritemp:
                 for t, c in [("Room", "green"), ("Cold", "blue"), ("Hot", "red")]:
                     tmp = dist_df[dist_df["Temp"] == t]
                     if not tmp.empty:
-                        l_vals = tmp["LSL"].dropna().unique()
-                        u_vals = tmp["USL"].dropna().unique()
-                        if l_vals.size:
-                            ax1.axvline(l_vals[0], color=c, linestyle="--", alpha=0.7)
-                        if u_vals.size:
-                            ax1.axvline(u_vals[0], color=c, linestyle="--", alpha=0.7)
+                        l, u = tmp["LSL"].dropna().unique(), tmp["USL"].dropna().unique()
+                        if l.size: ax1.axvline(l[0], color=c, linestyle="--", alpha=0.7)
+                        if u.size: ax1.axvline(u[0], color=c, linestyle="--", alpha=0.7)
             else:
-                l_vals = dist_df["LSL"].dropna().unique()
-                u_vals = dist_df["USL"].dropna().unique()
-                if l_vals.size:
-                    ax1.axvline(l_vals[0], color="black", linestyle="--", alpha=0.7)
-                if u_vals.size:
-                    ax1.axvline(u_vals[0], color="black", linestyle="--", alpha=0.7)
+                l, u = dist_df["LSL"].dropna().unique(), dist_df["USL"].dropna().unique()
+                if l.size: ax1.axvline(l[0], color="black", linestyle="--", alpha=0.7)
+                if u.size: ax1.axvline(u[0], color="black", linestyle="--", alpha=0.7)
 
+        # PLOT 2: Box Plot
         if xmode == "Sheet":
             x_col = "Sheet"
             ax2.set_title(f"{base_param} by Sheet / Lot")
@@ -1668,38 +1995,28 @@ class QualAnalyzerV20:
             dist_plot = dist_plot[dist_plot["SN"].isin(counts)]
 
         if self.is_tritemp:
-            sns.boxplot(
-                data=dist_plot,
-                x=x_col,
-                y="Value",
-                hue="Temp",
-                ax=ax2,
-                palette={"Room": "green", "Cold": "blue", "Hot": "red"},
-            )
+            sns.boxplot(data=dist_plot, x=x_col, y="Value", hue="Temp", ax=ax2,
+                        palette={"Room": "green", "Cold": "blue", "Hot": "red"})
             ax2.legend(title="Temp", fontsize=8)
         else:
             sns.boxplot(data=dist_plot, x=x_col, y="Value", ax=ax2, color="lightgray")
 
         ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha="right")
+        ax2.set_ylabel(f"Value{unit_lbl}")  # <--- Unit Added
 
         if show_limits:
+            # (Limit drawing logic same as histogram but horizontal lines...)
             if self.is_tritemp:
                 for t, c in [("Room", "green"), ("Cold", "blue"), ("Hot", "red")]:
                     tmp = dist_plot[dist_plot["Temp"] == t]
                     if not tmp.empty:
-                        l_vals = tmp["LSL"].dropna().unique()
-                        u_vals = tmp["USL"].dropna().unique()
-                        if l_vals.size:
-                            ax2.axhline(l_vals[0], color=c, linestyle="--", alpha=0.7)
-                        if u_vals.size:
-                            ax2.axhline(u_vals[0], color=c, linestyle="--", alpha=0.7)
+                        l, u = tmp["LSL"].dropna().unique(), tmp["USL"].dropna().unique()
+                        if l.size: ax2.axhline(l[0], color=c, linestyle="--", alpha=0.7)
+                        if u.size: ax2.axhline(u[0], color=c, linestyle="--", alpha=0.7)
             else:
-                l_vals = dist_plot["LSL"].dropna().unique()
-                u_vals = dist_plot["USL"].dropna().unique()
-                if l_vals.size:
-                    ax2.axhline(l_vals[0], color="black", linestyle="--", alpha=0.7)
-                if u_vals.size:
-                    ax2.axhline(u_vals[0], color="black", linestyle="--", alpha=0.7)
+                l, u = dist_plot["LSL"].dropna().unique(), dist_plot["USL"].dropna().unique()
+                if l.size: ax2.axhline(l[0], color="black", linestyle="--", alpha=0.7)
+                if u.size: ax2.axhline(u[0], color="black", linestyle="--", alpha=0.7)
 
         self.viz_canvas.draw()
 
@@ -2192,7 +2509,9 @@ class QualAnalyzerV20:
             # Dynamic Colors: Red for outliers, Blue for normal
             colors = ['red' if x > threshold else 'steelblue' for x in df_clean["Mahalanobis"]]
 
-            ax.scatter(df_clean["UnivarScore"], df_clean["Mahalanobis"], alpha=0.6, edgecolors='black', c=colors)
+            sc = ax.scatter(df_clean["UnivarScore"], df_clean["Mahalanobis"], alpha=0.6, edgecolors='black', c=colors)
+            # df_clean.index contains the SNs because you set index="SN" earlier
+            self._add_cursor_hover(sc, labels=df_clean.index)
 
             # Plot the Limit Line
             ax.axhline(threshold, color='red', linestyle='--', label=f"Limit: {threshold:.1f}")
@@ -2508,96 +2827,64 @@ class QualAnalyzerV20:
             if not param_x_base or not param_y_base: return
             if self.measure_long is None: return
 
-            # 1. Filter Data by Sheet first (Efficiency)
+            # --- UNIT LOOKUP (X and Y) ---
+            def get_u(p_base):
+                for s in self.units_dict:
+                    for p, u in self.units_dict[s].items():
+                        if p_base in p and u: return u
+                return ""
+
+            ux = get_u(param_x_base)
+            uy = get_u(param_y_base)
+            lbl_x = f"{param_x_base} ({ux})" if ux else param_x_base
+            lbl_y = f"{param_y_base} ({uy})" if uy else param_y_base
+
+            # 1. Filter Data
             df = self.measure_long.copy()
             if target_sheet and target_sheet != "All Combined":
                 df = df[df["Sheet"] == target_sheet]
 
-            # 2. Identify Rows matching the Base Parameters
-            # We add a 'Base' column temporarily to filter
             df["Base"] = df["Parameter"].apply(self._get_base)
-
-            # Filter down to just the X and Y params we care about
             sub = df[df["Base"].isin([param_x_base, param_y_base])].copy()
+            if sub.empty: return
 
-            if sub.empty:
-                messagebox.showinfo("Info", "No data found for these parameters.")
-                return
-
-            # 3. Extract Temperature for Alignment
-            # We need to know that "Icc (Hot)" goes with "Vout (Hot)"
             def get_temp_category(p_name):
                 lower = p_name.lower()
                 if "hot" in lower: return "Hot"
                 if "cold" in lower: return "Cold"
                 if "room" in lower: return "Room"
-                return "Unknown"  # Fallback
+                return "Unknown"
 
             sub["Temp"] = sub["Parameter"].apply(get_temp_category)
 
-            # 4. PIVOT: The Magic Step
-            # We pivot so that we have columns for the Base Parameters
-            # Index includes ['SN', 'Sheet', 'Temp'] ensuring strict alignment
-            # (e.g. SN1 at Sheet1 at Hot Temp)
-
-            pivoted = sub.pivot_table(
-                index=["SN", "Sheet", "Temp"],
-                columns="Base",
-                values="Value"
-            ).reset_index()
-
-            # Remove rows where one of the values is missing (e.g. maybe X was measured at Hot but Y wasn't)
+            # Pivot
+            pivoted = sub.pivot_table(index=["SN", "Sheet", "Temp"], columns="Base", values="Value").reset_index()
             pivoted = pivoted.dropna(subset=[param_x_base, param_y_base])
 
-            if pivoted.empty:
-                messagebox.showinfo("Info",
-                                    "No overlapping data found (Check if both params were measured at same temps).")
-                return
+            if pivoted.empty: return
 
-            # 5. Plot
+            # Plot
             self.scat_fig.clf()
             ax = self.scat_fig.add_subplot(111)
 
-            # Determine Hue Column
             hue_col = None
             palette = None
-
             if hue_mode == "Sheet":
-                hue_col = "Sheet"
+                hue_col = "Sheet";
                 palette = "tab10"
             elif hue_mode == "Temp":
-                hue_col = "Temp"
+                hue_col = "Temp";
                 palette = {"Room": "green", "Cold": "blue", "Hot": "red", "Unknown": "gray"}
 
-            # Scatter Plot
-            sns.scatterplot(
-                data=pivoted,
-                x=param_x_base,
-                y=param_y_base,
-                hue=hue_col,
-                style=hue_col,
-                palette=palette,
-                alpha=0.7,
-                edgecolor='black',
-                s=50,
-                ax=ax
-            )
+            sc = sns.scatterplot(data=pivoted, x=param_x_base, y=param_y_base, hue=hue_col, style=hue_col,
+                                 palette=palette, alpha=0.7, edgecolor='black', s=50, ax=ax)
 
-            # Optional: Add Regression Lines if grouped
-            if hue_col and len(pivoted) < 2000:
-                groups = pivoted[hue_col].unique()
-                for grp in groups:
-                    grp_data = pivoted[pivoted[hue_col] == grp]
-                    if len(grp_data) > 1:
-                        # Draw line manually to match color
-                        sns.regplot(
-                            data=grp_data, x=param_x_base, y=param_y_base,
-                            scatter=False, ci=None,
-                            line_kws={'alpha': 0.5, 'linewidth': 1, 'linestyle': '--'},
-                            ax=ax, color=None
-                        )
+            if ax.collections:
+                self._add_cursor_hover(ax.collections[0], labels=pivoted["SN"])
 
             ax.set_title(f"Interactive Scatter: {param_x_base} vs {param_y_base}", fontweight='bold')
+            ax.set_xlabel(lbl_x)  # <--- Units Added
+            ax.set_ylabel(lbl_y)  # <--- Units Added
             ax.grid(True, linestyle=':', alpha=0.6)
 
             self.scat_fig.tight_layout()
@@ -2606,6 +2893,1764 @@ class QualAnalyzerV20:
         except Exception as e:
             messagebox.showerror("Plot Error", f"Scatter failed:\n{str(e)}")
 
+    def run_stress_analysis(self):
+        """
+        Sequential Qual Analysis:
+        1. Stacked Severity (Which step caused the most immediate shock?).
+        2. Cumulative Damage Path (Trace the degradation of Top 5 Params over time).
+        3. Top Wear-Out Ranking.
+        """
+        if not self.data_dict or len(self.data_dict) < 2:
+            messagebox.showinfo("Info", "Need at least 2 test steps for sequential analysis.")
+            return
+
+        try:
+            sheet_order = list(self.data_dict.keys())
+
+            # --- PART 1: GLOBAL SHOCK (Severity Buckets) ---
+            step_labels = []
+            bucket_data = {"Stable": [], "Drifting": [], "Unstable": []}
+
+            for i in range(len(sheet_order) - 1):
+                step_name = f"{sheet_order[i]}->{sheet_order[i + 1]}"
+                step_labels.append(step_name)
+
+                df_pre = self.data_dict[sheet_order[i]]
+                df_post = self.data_dict[sheet_order[i + 1]]
+
+                common_cols = list(set(df_pre.select_dtypes(include=[np.number]).columns) &
+                                   set(df_post.select_dtypes(include=[np.number]).columns))
+                if "SN" in common_cols: common_cols.remove("SN")
+
+                shifts = []
+                for col in common_cols:
+                    s_pre = df_pre[col].std()
+                    if s_pre > 1e-9:
+                        shifts.append(abs(df_post[col].mean() - df_pre[col].mean()) / s_pre)
+                    else:
+                        shifts.append(0)
+
+                shifts = np.array(shifts)
+                if len(shifts) > 0:
+                    bucket_data["Unstable"].append(np.sum(shifts > 3.0) / len(shifts) * 100)
+                    bucket_data["Drifting"].append(np.sum((shifts >= 1.0) & (shifts <= 3.0)) / len(shifts) * 100)
+                    bucket_data["Stable"].append(np.sum(shifts < 1.0) / len(shifts) * 100)
+                else:
+                    for k in bucket_data: bucket_data[k].append(0)
+
+            # --- PART 2: CUMULATIVE DAMAGE PATH (Top 5 Params) ---
+            # We need to calculate the drift of EVERY param at EVERY step relative to T0
+            df_start = self.data_dict[sheet_order[0]]
+            common_cols_all = set(df_start.select_dtypes(include=[np.number]).columns)
+            if "SN" in common_cols_all: common_cols_all.remove("SN")
+
+            # Identify Top 5 Worst Parameters (Final vs Initial)
+            final_shifts = []
+            df_end = self.data_dict[sheet_order[-1]]
+
+            for col in common_cols_all:
+                if col in df_end.columns:
+                    base = self._get_base(col)
+                    s0 = df_start[col].std()
+                    if s0 > 1e-9:
+                        shift = abs(df_end[col].mean() - df_start[col].mean()) / s0
+                        final_shifts.append((base, col, shift))  # Keep col for tracking, base for label
+
+            # Sort and pick unique top base params to avoid duplicates (e.g. Icc Room + Icc Hot)
+            final_shifts.sort(key=lambda x: x[2], reverse=True)
+            top_params = []
+            seen_bases = set()
+            for base, col, s in final_shifts:
+                if base not in seen_bases:
+                    top_params.append(col)
+                    seen_bases.add(base)
+                if len(top_params) >= 5: break
+
+            # Trace their path
+            # x-axis: 0, 1, 2, 3 (Steps)
+            # y-axis: Cumulative Drift (Sigma)
+            trace_data = {col: [0] for col in top_params}  # Starts at 0 drift
+
+            for i in range(1, len(sheet_order)):
+                s_name = sheet_order[i]
+                df_curr = self.data_dict[s_name]
+                for col in top_params:
+                    if col in df_curr.columns:
+                        # Drift relative to START
+                        mean_0 = df_start[col].mean()
+                        mean_i = df_curr[col].mean()
+                        std_0 = df_start[col].std()
+                        drift = (mean_i - mean_0) / std_0 if std_0 > 1e-9 else 0
+                        trace_data[col].append(drift)
+                    else:
+                        trace_data[col].append(0)
+
+            # --- VISUALIZATION ---
+            self.contrib_fig.clf()
+            gs = self.contrib_fig.add_gridspec(1, 3)
+
+            # PLOT 1: Stacked Severity (The "Hit")
+            ax1 = self.contrib_fig.add_subplot(gs[0, 0])
+            x = np.arange(len(step_labels))
+            ax1.bar(x, bucket_data["Unstable"], color='#d62728', label='>3σ')
+            ax1.bar(x, bucket_data["Drifting"], bottom=bucket_data["Unstable"], color='#ff7f0e', label='1-3σ')
+            ax1.bar(x, bucket_data["Stable"],
+                    bottom=np.array(bucket_data["Unstable"]) + np.array(bucket_data["Drifting"]), color='#2ca02c',
+                    label='<1σ')
+            ax1.set_title("1. Environment Severity", fontweight='bold', fontsize=9)
+            ax1.set_ylabel("% Params Affected")
+            ax1.set_xticks(x)
+            ax1.set_xticklabels(step_labels, rotation=45, ha='right', fontsize=7)
+            ax1.legend(fontsize=6)
+
+            # PLOT 2: Cumulative Damage Waterfall
+            ax2 = self.contrib_fig.add_subplot(gs[0, 1])
+            step_indices = range(len(sheet_order))
+
+            markers = ['o', 's', '^', 'D', 'v']
+            for i, col in enumerate(top_params):
+                label = self._get_base(col)
+                ax2.plot(step_indices, trace_data[col], marker=markers[i], linewidth=1.5, label=label)
+
+            ax2.set_title("2. Cumulative Damage Path", fontweight='bold', fontsize=9)
+            ax2.set_ylabel("Total Drift from Start (σ)")
+            ax2.set_xticks(step_indices)
+            ax2.set_xticklabels(sheet_order, rotation=45, ha='right', fontsize=7)
+            ax2.grid(True, linestyle=':', alpha=0.5)
+            ax2.legend(fontsize=7)
+
+            # PLOT 3: Final Leaderboard
+            ax3 = self.contrib_fig.add_subplot(gs[0, 2])
+            names = [self._get_base(col) for col in top_params]
+            vals = [trace_data[col][-1] for col in top_params]  # Final drift value
+
+            sns.barplot(x=vals, y=names, ax=ax3, palette="magma")
+            ax3.set_title("3. Most Degraded Params", fontweight='bold', fontsize=9)
+            ax3.set_xlabel("Final Total Drift (σ)")
+
+            self.contrib_fig.tight_layout()
+            self.contrib_canvas.draw()
+
+            # --- TEXT REPORT ---
+            txt = f"SEQUENTIAL QUAL REPORT\n{'=' * 30}\n"
+
+            # Identify the "Killer Step"
+            # Which step caused the biggest JUMP in drift for the worst parameter?
+            worst_param = top_params[0]
+            drifts = trace_data[worst_param]
+            jumps = [abs(drifts[i] - drifts[i - 1]) for i in range(1, len(drifts))]
+            max_jump_idx = np.argmax(jumps)
+            killer_step = f"{sheet_order[max_jump_idx]} -> {sheet_order[max_jump_idx + 1]}"
+
+            txt += f"HIGHEST IMPACT TRANSITION: {killer_step}\n"
+            txt += f"  (Caused max damage to {self._get_base(worst_param)})\n\n"
+
+            txt += "DEGRADATION TIMELINE (Top Param):\n"
+            for i, d in enumerate(drifts):
+                txt += f"  {sheet_order[i]}: {d:.2f}σ\n"
+
+            self.txt_assess.delete("1.0", tk.END)
+            self.txt_assess.insert(tk.END, txt)
+
+        except Exception as e:
+            messagebox.showerror("Analysis Error", f"Sequential analysis failed:\n{str(e)}")
+
+    def _add_cursor_hover(self, artist, labels=None):
+        """
+        Attaches a hover tooltip to a matplotlib artist (scatter plot or line).
+
+        Args:
+            artist: The matplotlib collection (returned by ax.scatter or ax.plot).
+            labels: A pandas Series or list of strings (e.g., Serial Numbers)
+                    that align exactly with the data points.
+        """
+        # Create the cursor bound to the specific artist (dots/lines)
+        cursor = mplcursors.cursor(artist, hover=True)
+
+        @cursor.connect("add")
+        def on_add(sel):
+            # 1. Get standard X, Y coordinates
+            x_val, y_val = sel.target
+
+            # 2. Format the base text
+            text = f"X={x_val:.3f}\nY={y_val:.3f}"
+
+            # 3. If we have Serial Numbers (labels), look up the correct one
+            if labels is not None:
+                # sel.index is the index of the point in the plotted array
+                try:
+                    # Handle pandas Series or standard lists
+                    if hasattr(labels, 'iloc'):
+                        sn = labels.iloc[sel.index]
+                    else:
+                        sn = labels[sel.index]
+                    text = f"SN: {sn}\n{text}"
+                except IndexError:
+                    pass  # Fallback if indices don't match
+
+            # 4. Set text and style the box
+            sel.annotation.set_text(text)
+            sel.annotation.get_bbox_patch().set(boxstyle="round,pad=0.5", fc="white", alpha=0.9, ec="black")
+
+    def toggle_theme(self):
+        """Switches between Light (Cosmo) and Dark (Darkly) modes."""
+        current = self.style.theme.name
+        new_theme = "cosmo" if current == "darkly" else "darkly"
+        self.style.theme_use(new_theme)
+
+        # Refresh the grid to fix text colors (Black text on colored rows)
+        if hasattr(self, 'tree_raw'):
+            self.update_inspector_grid(None)
+
+    def plot_bin_pareto(self):
+        """
+        Interactive Pareto V11 (Fully Interactive Drill-Down):
+        - Visualizes Bin Counts.
+        - Drill-Down: Shows Raw Values vs Population.
+        - INTERACTIVITY: Hover over Red/Green dots to see Serial Numbers (SN).
+        """
+        if not self.bin_map:
+            messagebox.showinfo("Info", "No Bin data found. Ensure 'Bin Column' is set.")
+            return
+
+        # Setup Window
+        win = tk.Toplevel(self.root)
+        win.title("Yield & Bin Analysis (Interactive)")
+        win.geometry("1200x800")
+
+        # Control Frame
+        ctrl_frame = ttk.Frame(win, padding=5)
+        ctrl_frame.pack(fill=tk.X)
+        ttk.Label(ctrl_frame, text="Select Test Step:").pack(side=tk.LEFT, padx=5)
+
+        sheets = list(self.bin_map.keys())
+        combo_sheet = ttk.Combobox(ctrl_frame, state="readonly", values=["All Combined"] + sheets)
+        combo_sheet.current(0)
+        combo_sheet.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(ctrl_frame, text="(Click bar to Drill-Down -> Hover dots for SN)", foreground="gray").pack(
+            side=tk.LEFT, padx=15)
+
+        # Split Layout
+        paned = ttk.Panedwindow(win, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+        frame_plot = ttk.Frame(paned)
+        frame_text = ttk.Frame(paned, height=150)
+        paned.add(frame_plot, weight=4)
+        paned.add(frame_text, weight=1)
+
+        # Matplotlib Figure
+        fig = plt.Figure(figsize=(8, 6), dpi=100)
+        canvas = FigureCanvasTkAgg(fig, master=frame_plot)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Text Report
+        txt_report = tk.Text(frame_text, wrap=tk.WORD, font=("Consolas", 9), height=8)
+        txt_report.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # State storage
+        current_plot_data = {"bins": [], "sheet": ""}
+
+        # --- DRILL DOWN FUNCTION ---
+        def open_drill_down(bin_val, sheet_name):
+            # 1. Identify SNs
+            sns_in_bin = []
+            if sheet_name == "All Combined":
+                for s in self.bin_map:
+                    for sn, b in self.bin_map[s].items():
+                        if str(b) == str(bin_val): sns_in_bin.append(str(sn))
+            else:
+                data = self.bin_map.get(sheet_name, {})
+                sns_in_bin = [str(k) for k, v in data.items() if str(v) == str(bin_val)]
+
+            if not sns_in_bin: return
+
+            # 2. Pass/Fail Logic
+            is_pass_bin = (str(bin_val) == "1")
+            top_params = []
+
+            if is_pass_bin:
+                if self.measure_long is not None:
+                    top_params = self.measure_long["Parameter"].unique()[:3].tolist()
+            else:
+                if not self.failures:
+                    messagebox.showinfo("Info", "No parametric failures logged.")
+                    return
+
+                df_f = pd.DataFrame(self.failures)
+                mask_sn = df_f['SN'].astype(str).isin(sns_in_bin)
+
+                if sheet_name != "All Combined":
+                    mask_sheet = df_f['Sheet'] == sheet_name
+                    fail_subset = df_f[mask_sn & mask_sheet]
+                else:
+                    fail_subset = df_f[mask_sn]
+
+                if fail_subset.empty:
+                    messagebox.showinfo("Info", "Bin contains units but no parametric fails.")
+                    return
+
+                top_params = [fail_subset["Parameter"].value_counts().idxmax()]
+
+            # 3. PLOT WINDOW
+            popup = tk.Toplevel(win)
+            popup.title(f"Drill Down: Bin {bin_val}")
+            popup.geometry("900x600")
+
+            fig_dd = plt.Figure(figsize=(8, 6), dpi=100)
+            ax_dd = fig_dd.add_subplot(111)
+
+            param_to_plot = top_params[0]
+
+            if self.measure_long is not None:
+                mask_p = self.measure_long["Parameter"] == param_to_plot
+                if sheet_name != "All Combined":
+                    mask_s = self.measure_long["Sheet"] == sheet_name
+                    pop_data = self.measure_long[mask_p & mask_s].copy()
+                else:
+                    pop_data = self.measure_long[mask_p].copy()
+
+                if not pop_data.empty:
+
+                    # 1. Identify Failures
+                    if self.failures:
+                        df_all_fails = pd.DataFrame(self.failures)
+                        this_param_fails = df_all_fails[df_all_fails["Parameter"] == param_to_plot]
+                        sns_failed_this_param = set(this_param_fails["SN"].astype(str))
+                    else:
+                        sns_failed_this_param = set()
+
+                    # 2. Status Tagging
+                    def get_status(sn):
+                        sn_str = str(sn)
+                        if sn_str in sns_in_bin:
+                            if is_pass_bin: return "Pass Bin"
+                            if sn_str in sns_failed_this_param: return "Strict Fail"
+                            return "Bin Member (Passing)"
+                        return "Population"
+
+                    pop_data["Status"] = pop_data["SN"].apply(get_status)
+
+                    # 3. PLOT LAYERS
+
+                    # A. Gray Box (Population)
+                    background_data = pop_data[pop_data["Status"].isin(["Population", "Bin Member (Passing)"])]
+                    if not background_data.empty:
+                        sns.boxplot(y=background_data["Value"], ax=ax_dd, color="lightgray", width=0.5,
+                                    showfliers=False)
+
+                    # B. Red Dots (Strict Failures)
+                    strict_fails = pop_data[pop_data["Status"] == "Strict Fail"]
+                    if not strict_fails.empty:
+                        # Plot
+                        sns.stripplot(y=strict_fails["Value"], ax=ax_dd, color="#d62728", size=7,
+                                      edgecolor="black", linewidth=1, jitter=0.2, label=f"Bin {bin_val} Rejects")
+
+                        # --- INTERACTIVITY: Add Hover to Red Dots ---
+                        # sns.stripplot adds a PathCollection to the axes. It is the last one added.
+                        if ax_dd.collections:
+                            self._add_cursor_hover(ax_dd.collections[-1], labels=strict_fails["SN"])
+
+                    # C. Green Dots (Pass Bin)
+                    pass_data = pop_data[pop_data["Status"] == "Pass Bin"]
+                    if not pass_data.empty:
+                        sns.stripplot(y=pass_data["Value"], ax=ax_dd, color="green", alpha=0.5, size=5, jitter=0.2)
+
+                        # --- INTERACTIVITY: Add Hover to Green Dots ---
+                        if ax_dd.collections:
+                            self._add_cursor_hover(ax_dd.collections[-1], labels=pass_data["SN"])
+
+                    # Titles & Limits
+                    ax_dd.set_title(f"Driver Analysis: {param_to_plot}\n(Hover dots for SN)", fontweight="bold")
+                    if not strict_fails.empty: ax_dd.legend(loc='upper right')
+
+                    s_lookup = sheet_name if sheet_name != "All Combined" else list(self.data_dict.keys())[0]
+                    l, u = self.limits_dict.get(s_lookup, {}).get(param_to_plot, (np.nan, np.nan))
+
+                    if not pd.isna(l): ax_dd.axhline(l, color='blue', linestyle='--', label=f"LSL: {l}")
+                    if not pd.isna(u): ax_dd.axhline(u, color='red', linestyle='--', label=f"USL: {u}")
+
+                    unit_str = ""
+                    if s_lookup in self.units_dict and param_to_plot in self.units_dict[s_lookup]:
+                        unit_str = self.units_dict[s_lookup][param_to_plot]
+
+                    ax_dd.set_ylabel(f"Value ({unit_str})" if unit_str else "Value")
+                    ax_dd.grid(True, alpha=0.3)
+
+            canvas_dd = FigureCanvasTkAgg(fig_dd, master=popup)
+            canvas_dd.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # --- CLICK EVENT ---
+        def on_bar_click(event):
+            if event.inaxes is None: return
+            bars = getattr(update_chart, "current_bars", None)
+            if not bars: return
+            for i, bar in enumerate(bars):
+                if bar.contains(event)[0]:
+                    target_bin = current_plot_data["bins"][i]
+                    target_sheet = current_plot_data["sheet"]
+                    open_drill_down(target_bin, target_sheet)
+                    break
+
+        canvas.mpl_connect("button_press_event", on_bar_click)
+
+        # --- MAIN CHART ---
+        def update_chart(event=None):
+            fig.clear()
+            ax = fig.add_subplot(111)
+            ax_cum = ax.twinx()
+
+            selected_sheet = combo_sheet.get()
+            current_plot_data["sheet"] = selected_sheet
+
+            if selected_sheet == "All Combined":
+                all_bins = []
+                for s in self.bin_map: all_bins.extend(list(self.bin_map[s].values()))
+                if not all_bins: return
+                total_counts = pd.Series(all_bins).value_counts()
+            else:
+                data = self.bin_map.get(selected_sheet, {})
+                if not data: return
+                total_counts = pd.Series(list(data.values())).value_counts()
+
+            chart_x, chart_y, raw_bins, meta = [], [], [], []
+            if self.failures:
+                df_fail = pd.DataFrame(self.failures)
+            else:
+                df_fail = pd.DataFrame(columns=["Sheet", "Bin", "Parameter"])
+
+            for bin_val in total_counts.index:
+                count = total_counts[bin_val]
+                raw_bins.append(bin_val)
+
+                if selected_sheet == "All Combined":
+                    subset = df_fail[df_fail["Bin"] == str(bin_val)]
+                else:
+                    subset = df_fail[(df_fail["Bin"] == str(bin_val)) & (df_fail["Sheet"] == selected_sheet)]
+
+                label_text = str(bin_val)
+                is_fail_bin = False
+
+                if str(bin_val) != "1" and not subset.empty:
+                    is_fail_bin = True
+                    top_param = subset["Parameter"].value_counts().idxmax()
+                    short = str(top_param).split(' ')[0]
+                    label_text += f"\n({short})"
+                else:
+                    label_text += "\n(Yield)"
+
+                chart_x.append(label_text)
+                chart_y.append(count)
+                meta.append(is_fail_bin)
+
+            if not chart_x: return
+
+            zipped = sorted(zip(chart_x, chart_y, raw_bins, meta), key=lambda x: x[1], reverse=True)
+            final_x, final_y, final_bins, final_meta = zip(*zipped)
+            current_plot_data["bins"] = final_bins
+
+            colors = ["#d62728" if m else "#2ca02c" for m in final_meta]
+            bars = ax.bar(final_x, final_y, color=colors, edgecolor="black", alpha=0.8)
+            update_chart.current_bars = bars
+
+            total = sum(final_y)
+            cum_pct = (np.cumsum(final_y) / total) * 100
+            ax_cum.plot(final_x, cum_pct, color="navy", marker="o", lw=2)
+
+            ax.set_title(f"Pareto: {selected_sheet} (Click Bars to Drill-Down)", fontweight="bold")
+            ax.set_ylabel("Count")
+            ax_cum.set_ylabel("Cumulative %")
+            ax_cum.set_ylim(0, 110)
+
+            for bar in bars:
+                h = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width() / 2., h, f'{int(h)}', ha='center', va='bottom')
+
+            fig.tight_layout()
+            canvas.draw()
+
+            txt_report.delete("1.0", tk.END)
+            txt_report.insert(tk.END, f"SUMMARY: {selected_sheet}\n" + "=" * 40 + "\n")
+            for i, x in enumerate(final_x):
+                txt_report.insert(tk.END, f"{i + 1}. {x.replace(chr(10), ' ')}: {final_y[i]} units\n")
+
+        combo_sheet.bind("<<ComboboxSelected>>", update_chart)
+        update_chart()
+
+    def highlight_sns_in_inspector(self, sn_list):
+        """
+        Filters the Inspector Grid to show ONLY the provided Serial Numbers.
+        Used by the Pareto Drill-Down feature.
+        """
+        # 1. Switch to Inspector Tab
+        self.notebook.select(0)  # Assuming Index 0 is Inspector
+
+        # 2. Get Current Data
+        sheet = self.combo_inspect_sheet.get()
+        if sheet not in self.raw_previews: return
+        df = self.raw_previews[sheet]
+
+        # 3. Filter DF by SN
+        # Make sure types match (string vs string)
+        mask = df["SN"].astype(str).isin([str(x) for x in sn_list])
+        filtered_df = df[mask]
+
+        if filtered_df.empty:
+            messagebox.showinfo("Info", "Selected SNs not found in current sheet.")
+            return
+
+        # 4. Update Grid with Filtered Data
+        # We perform a "Manual Override" of the grid display
+        self.tree_raw.delete(*self.tree_raw.get_children())
+
+        # Reuse existing column config...
+
+        # Insert filtered rows
+        h = self.var_header_row.get()
+
+        # We need to map the original indices to keep colors correct?
+        # For simplicity, we just dump the data to show the user the bad units.
+        for i, row in filtered_df.iterrows():
+            vals = [str(x) if not pd.isna(x) else "" for x in row]
+
+            # Simple Tagging
+            tag = ""
+            if i == h: tag = "HEADER"
+
+            self.tree_raw.insert("", "end", values=vals, tags=(tag,))
+
+        self.lbl_status.config(text=f"Inspector Filtered: Showing {len(filtered_df)} Units from Drill-Down")
+
+    def verify_structure_map(self):
+        """
+        Enhanced Health Check V5:
+        1. Sequence & Duplicates.
+        2. Limits Existence & Consistency.
+        3. [NEW] UNIT CONSISTENCY CHECK (Detects scaling errors like nA vs uA).
+        4. Test Plan Export.
+        """
+        sheet = self.combo_inspect_sheet.get()
+        if not sheet or sheet not in self.data_dict:
+            messagebox.showinfo("Info", "Please select a valid sheet first.")
+            return
+
+        df = self.data_dict[sheet]
+        limits = self.limits_dict.get(sheet, {})
+        units = self.units_dict.get(sheet, {})
+
+        # Structure: {BaseParam: {Room: [], Cold: [], Hot: [], NoTag: []}}
+        structure = {}
+
+        cols = df.columns
+        for idx, col in enumerate(cols):
+            if col == "SN": continue
+
+            # Determine Temp and Base
+            temp = "Unknown"
+            base = col
+            if "(Room)" in col:
+                temp = "Room"
+                base = col.replace("(Room)", "").strip()
+            elif "(Cold)" in col:
+                temp = "Cold"
+                base = col.replace("(Cold)", "").strip()
+            elif "(Hot)" in col:
+                temp = "Hot"
+                base = col.replace("(Hot)", "").strip()
+            else:
+                temp = "NoTag"
+
+            if base not in structure:
+                structure[base] = {"Room": [], "Cold": [], "Hot": [], "NoTag": []}
+            structure[base][temp].append((idx, col))
+
+        # --- GUI SETUP ---
+        win = tk.Toplevel(self.root)
+        win.title(f"Structure & Unit Audit: {sheet}")
+        win.geometry("1400x700")
+
+        # Top Bar
+        bar = ttk.Frame(win, padding=10)
+        bar.pack(fill=tk.X)
+        ttk.Label(bar, text="Structure & Unit Audit", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
+
+        def run_export():
+            self.export_test_plan_excel(sheet, structure, limits, units)
+
+        ttk.Button(bar, text="Export Test Plan", command=run_export, bootstyle="success").pack(side=tk.RIGHT)
+
+        # Grid
+        tree_frame = ttk.Frame(win, padding=10)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("Parameter", "R/C/H Indices", "Limits?", "Limits Match?", "Units Match?", "Status")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+
+        tree.column("Parameter", width=200, anchor="w")
+        tree.column("R/C/H Indices", width=120, anchor="center")
+        tree.column("Limits?", width=60, anchor="center")
+        tree.column("Limits Match?", width=200, anchor="w")
+        tree.column("Units Match?", width=200, anchor="w")  # <--- NEW COLUMN
+        tree.column("Status", width=150, anchor="w")
+
+        for c in cols: tree.heading(c, text=c)
+
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Styles
+        tree.tag_configure("OK", foreground="green")
+        tree.tag_configure("MISSING", foreground="red", background="#ffebeb")
+        tree.tag_configure("DUPE", foreground="blue", background="#e6f2ff")
+        tree.tag_configure("NOLIMIT", foreground="#cc5500", background="#fff5e6")
+        tree.tag_configure("UNIT_ERR", foreground="#d62728", background="#ffffcc")  # Red text, yellow bg
+
+        # Populate
+        sorted_keys = sorted(structure.keys())
+        for base in sorted_keys:
+            d = structure[base]
+
+            # --- Indices ---
+            r_str = str(d['Room'][0][0]) if d['Room'] else "-"
+            c_str = str(d['Cold'][0][0]) if d['Cold'] else "-"
+            h_str = str(d['Hot'][0][0]) if d['Hot'] else "-"
+            idx_display = f"{r_str} / {c_str} / {h_str}"
+
+            # --- Unit Consistency Check ---
+            active_units = {}
+            if d['Room']: active_units['R'] = units.get(d['Room'][0][1], "")
+            if d['Cold']: active_units['C'] = units.get(d['Cold'][0][1], "")
+            if d['Hot']:  active_units['H'] = units.get(d['Hot'][0][1], "")
+
+            # Remove empty units from check (sometimes user leaves them blank)
+            active_units = {k: v for k, v in active_units.items() if v}
+
+            unit_match_str = "-"
+            is_unit_mismatch = False
+
+            if len(set(active_units.values())) > 1:
+                # Mismatch found!
+                is_unit_mismatch = True
+                details = [f"{k}:{v}" for k, v in active_units.items()]
+                unit_match_str = " | ".join(details)
+            elif len(active_units) > 0:
+                # All match
+                val = list(active_units.values())[0]
+                unit_match_str = f"Yes ({val})"
+
+            # --- Checks (Existing Logic) ---
+            is_dupe = (len(d['Room']) > 1) or (len(d['Cold']) > 1) or (len(d['Hot']) > 1)
+
+            has_limits = False
+            for temp_list in [d['Room'], d['Cold'], d['Hot']]:
+                for _, original_name in temp_list:
+                    if original_name in limits:
+                        l, u = limits[original_name]
+                        if not (pd.isna(l) and pd.isna(u)): has_limits = True
+
+            # Limit Match (Info Only)
+            active_limits = {}
+            if d['Room']: active_limits['R'] = limits.get(d['Room'][0][1], (np.nan, np.nan))
+            if d['Cold']: active_limits['C'] = limits.get(d['Cold'][0][1], (np.nan, np.nan))
+            if d['Hot']:  active_limits['H'] = limits.get(d['Hot'][0][1], (np.nan, np.nan))
+
+            lim_match_str = "-"
+            if len(active_limits) > 1:
+                ref_val = list(active_limits.values())[0]
+                is_mis = False
+                details = []
+                for k, val in active_limits.items():
+                    l_disp = f"{val[0]:g}" if not pd.isna(val[0]) else "Nan"
+                    u_disp = f"{val[1]:g}" if not pd.isna(val[1]) else "Nan"
+                    details.append(f"{k}:{l_disp}/{u_disp}")
+
+                    l_eq = (pd.isna(ref_val[0]) and pd.isna(val[0])) or (ref_val[0] == val[0])
+                    u_eq = (pd.isna(ref_val[1]) and pd.isna(val[1])) or (ref_val[1] == val[1])
+                    if not (l_eq and u_eq): is_mis = True
+                lim_match_str = " | ".join(details) if is_mis else "Yes"
+            elif len(active_limits) == 1:
+                lim_match_str = "Single Temp"
+
+            # Status
+            status = "OK"
+            tag = "OK"
+            missing = []
+            if (any(v['Cold'] for v in structure.values()) or any(v['Hot'] for v in structure.values())):
+                if not d['Room']: missing.append("R")
+                if not d['Cold']: missing.append("C")
+                if not d['Hot']:  missing.append("H")
+
+            # Priority Logic
+            if missing:
+                status = f"Missing: {','.join(missing)}"
+                tag = "MISSING"
+            elif is_dupe:
+                status = "Duplicate"
+                tag = "DUPE"
+            elif is_unit_mismatch:
+                status = "Unit Mismatch"
+                tag = "UNIT_ERR"
+            elif not has_limits:
+                status = "No Limits"
+                tag = "NOLIMIT"
+
+            tree.insert("", "end", values=(
+                base, idx_display, "OK" if has_limits else "No", lim_match_str, unit_match_str, status
+            ), tags=(tag,))
+
+    def export_test_plan_excel(self, sheet, structure, limits, units):
+        """
+        Professional Test Plan Export V6:
+        - REMOVED: Max Temp Drift column.
+        - LAYOUT: True auto-fit columns based on content length.
+        - PRINT-READY: Configured for Landscape, Fit-to-Width, and Professional Styling.
+        """
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx")],
+            title="Generate Electrical Test Plan"
+        )
+        if not path: return
+
+        # 1. Validation & Setup
+        if sheet not in self.raw_previews:
+            messagebox.showerror("Error", "Raw data not found for this sheet.")
+            return
+
+        raw_df = self.raw_previews[sheet]
+        header_row_idx = self.var_header_row.get()
+        data_start_idx = self.var_data_start.get()
+
+        # Scan range for conditions
+        max_cond_row = min(header_row_idx + 4, data_start_idx, len(raw_df))
+        cond_rows = range(header_row_idx + 1, max_cond_row)
+
+        df_data = self.data_dict.get(sheet, pd.DataFrame())
+        rows = []
+        sorted_keys = sorted(structure.keys())
+        condition_keywords = ["load", "freq", "range", "mode", "force", "time", "delay", "temp", "vcc", "vdd", "vin"]
+
+        for base in sorted_keys:
+            d = structure[base]
+
+            # --- 1. SMART CONDITION SCRAPING ---
+            condition_str = ""
+            target_col_name = ""
+            if d['Room']:
+                target_col_name = d['Room'][0][1]
+            elif d['Cold']:
+                target_col_name = d['Cold'][0][1]
+            elif d['Hot']:
+                target_col_name = d['Hot'][0][1]
+
+            if target_col_name:
+                raw_col_idx = -1
+                raw_header_vals = raw_df.iloc[header_row_idx].values.astype(str)
+
+                for i, val in enumerate(raw_header_vals):
+                    if val.strip() and val.strip() in target_col_name:
+                        raw_col_idx = i
+                        break
+
+                if raw_col_idx != -1:
+                    found_conds = []
+                    for r_idx in cond_rows:
+                        val = str(raw_df.iloc[r_idx, raw_col_idx]).strip()
+                        if (val and val.lower() != "nan" and
+                                val not in self.units_dict.get(sheet, {}).values()):
+
+                            is_condition = False
+                            if "=" in val:
+                                is_condition = True
+                            elif any(k in val.lower() for k in condition_keywords):
+                                is_condition = True
+                            if val.count('.') >= 2 and not any(c.isalpha() for c in val): is_condition = False
+
+                            if is_condition: found_conds.append(val)
+                    condition_str = ", ".join(found_conds)
+
+            # --- 2. UNIT EXTRACTION ---
+            unit_val = ""
+            all_variants = d['Room'] + d['Cold'] + d['Hot'] + d['NoTag']
+            for _, orig_col in all_variants:
+                if orig_col in units and units[orig_col]:
+                    unit_val = units[orig_col]
+                    break
+
+            # --- 3. LIMITS ---
+            def get_lims(temp_key):
+                if d[temp_key]:
+                    orig = d[temp_key][0][1]
+                    l, u = np.nan, np.nan
+                    if orig in limits: l, u = limits[orig]
+                    return l, u
+                return np.nan, np.nan
+
+            r_l, r_u = get_lims('Room')
+            c_l, c_u = get_lims('Cold')
+            h_l, h_u = get_lims('Hot')
+
+            # --- BUILD ROW ---
+            rows.append({
+                "Parameter": base,
+                "Test Conditions": condition_str,
+                "Unit": unit_val,
+                "Room Min": r_l, "Room Max": r_u,
+                "Cold Min": c_l, "Cold Max": c_u,
+                "Hot Min": h_l, "Hot Max": h_u
+            })
+
+        df_export = pd.DataFrame(rows)
+
+        # --- SAFE EXPORT LOGIC ---
+        try:
+            import importlib.util
+            has_xlsxwriter = importlib.util.find_spec("xlsxwriter") is not None
+
+            if has_xlsxwriter:
+                with pd.ExcelWriter(path, engine='xlsxwriter') as writer:
+                    sheet_name = "Test Plan"
+                    df_export.to_excel(writer, index=False, sheet_name=sheet_name, startrow=1, header=False)
+
+                    workbook = writer.book
+                    worksheet = writer.sheets[sheet_name]
+
+                    # --- STYLES ---
+                    header_fmt = workbook.add_format({
+                        'bold': True, 'text_wrap': True, 'valign': 'vcenter', 'align': 'center',
+                        'fg_color': '#1F4E78', 'font_color': 'white', 'border': 1, 'font_size': 11
+                    })
+
+                    # Data Styles
+                    base_style = {'border': 1, 'valign': 'vcenter', 'font_size': 10}
+
+                    fmt_left = workbook.add_format(base_style)
+                    fmt_left_alt = workbook.add_format({**base_style, 'bg_color': '#F2F2F2'})
+
+                    fmt_center = workbook.add_format({**base_style, 'align': 'center'})
+                    fmt_center_alt = workbook.add_format({**base_style, 'align': 'center', 'bg_color': '#F2F2F2'})
+
+                    # --- WRITE HEADER ---
+                    for col_num, value in enumerate(df_export.columns.values):
+                        worksheet.write(0, col_num, value, header_fmt)
+
+                    # --- WRITE DATA & AUTO-FIT ---
+                    # Track max width for each column
+                    col_widths = [len(str(c)) for c in df_export.columns]
+
+                    for r_idx, row in enumerate(df_export.values):
+                        is_alt = (r_idx % 2 == 1)
+                        excel_row = r_idx + 1
+
+                        for c_idx, val in enumerate(row):
+                            # Style Selection
+                            if c_idx < 2:  # Param & Conditions = Left Align
+                                cell_style = fmt_left_alt if is_alt else fmt_left
+                            else:  # Units & Limits = Center Align
+                                cell_style = fmt_center_alt if is_alt else fmt_center
+
+                            val_str = ""
+                            if pd.isna(val) or val == "nan":
+                                worksheet.write_blank(excel_row, c_idx, "", cell_style)
+                            else:
+                                worksheet.write(excel_row, c_idx, val, cell_style)
+                                val_str = str(val)
+
+                            # Auto-Fit Logic
+                            curr_len = len(val_str)
+                            # Add buffer for 'Test Conditions' because it wraps less elegantly if tight
+                            if c_idx == 1: curr_len = min(curr_len, 60)  # Cap condition width
+
+                            if curr_len > col_widths[c_idx]:
+                                col_widths[c_idx] = curr_len
+
+                    # Apply Widths
+                    for i, width in enumerate(col_widths):
+                        # Add a little padding (e.g. +2 chars)
+                        worksheet.set_column(i, i, width + 3)
+
+                    # --- PRINT SETUP ---
+                    worksheet.set_landscape()
+                    worksheet.set_paper(9)  # A4 Paper (or 1 for US Letter)
+                    worksheet.fit_to_pages(1, 0)  # Fit to 1 page wide, infinite pages tall
+                    worksheet.center_horizontally()
+                    worksheet.set_header('&C&"Bold"Electrical Test Plan\n&D')
+                    worksheet.set_footer('&CPage &P of &N')
+
+                    # Repeat header row on every printed page
+                    worksheet.repeat_rows(0)
+
+            else:
+                df_export.to_excel(path, index=False)
+
+            messagebox.showinfo("Success", f"Test Plan Exported:\n{path}")
+
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to save:\n{str(e)}")
+
+    def generate_html_report(self):
+        """
+        Generates a comprehensive, interactive HTML report using Plotly.
+
+        INCLUDES:
+        1. Enhanced KPIs (with Wilson Score Confidence Intervals).
+        2. Failure Pareto (Bar).
+        3. Global Stability Analysis (Stacked Bar of Drifts).
+        4. Cpk Distribution (Histogram).
+        5. Worst-Case Parametric Drift (Scatter: T0 vs Final).
+        6. Risk Parameter Trends (Box Plots of Low Cpk).
+        7. Correlation Heatmap (Top 30 params).
+        8. Multivariate PCA Structure (Scatter).
+        """
+        if not PLOTLY_AVAILABLE:
+            messagebox.showerror("Missing Library",
+                                 "The 'plotly' library is required.\n"
+                                 "Please install: pip install plotly")
+            return
+
+        if not self.data_dict:
+            messagebox.showinfo("Error", "No data loaded.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML Files", "*.html")],
+            title="Save Interactive Report"
+        )
+        if not path: return
+
+        self.lbl_status.config(text="Generating Analytics Report...")
+        self.root.update_idletasks()
+
+        try:
+            # ==========================================
+            # 1. SHARED DATA CALCS
+            # ==========================================
+
+            # --- A. Basic Yield Stats ---
+            unique_sn = set()
+            for df in self.data_dict.values():
+                if "SN" in df.columns: unique_sn.update(df["SN"].dropna().astype(str).tolist())
+
+            total_units = len(unique_sn)
+            fail_count = len(set(f['SN'] for f in self.failures))
+            pass_count = total_units - fail_count
+            yield_pct = (pass_count / total_units * 100) if total_units else 0.0
+
+            # --- B. Wilson Score Interval (95% CI for Yield) ---
+            # Used to show "True Yield" range for small sample sizes
+            import scipy.stats as stats
+            z = 1.96  # 95% Conf
+            n = total_units
+            p = pass_count / n if n > 0 else 0
+
+            if n > 0:
+                denominator = 1 + z ** 2 / n
+                center_adjusted_probability = p + z ** 2 / (2 * n)
+                adjusted_standard_deviation = np.sqrt((p * (1 - p) + z ** 2 / (4 * n)) / n)
+                lower_bound = (center_adjusted_probability - z * adjusted_standard_deviation) / denominator
+                upper_bound = (center_adjusted_probability + z * adjusted_standard_deviation) / denominator
+                ci_text = f"95% CI: {lower_bound * 100:.1f}% - {upper_bound * 100:.1f}%"
+            else:
+                ci_text = "N/A"
+
+            # --- C. Cpk & Risk Identification ---
+            cpk_data = []
+            for s, df in self.data_dict.items():
+                for c in df.columns:
+                    if c == "SN": continue
+                    v = df[c].dropna()
+                    if v.std() < 1e-9: continue
+                    l, u = self.limits_dict[s].get(c, (np.nan, np.nan))
+                    val = self._calc_robust_cpk(v, l, u)
+                    if not pd.isna(val):
+                        cpk_data.append({"Sheet": s, "Param": c, "Cpk": val})
+
+            df_cpk = pd.DataFrame(cpk_data).sort_values("Cpk")
+            top_risks = df_cpk.head(4)  # Worst 4 params
+
+            # ==========================================
+            # 2. PLOT GENERATION
+            # ==========================================
+            figs_html = []
+
+            # --- FIG 1: Executive KPI Dashboard ---
+            fig_kpi = go.Figure()
+
+            # Yield Gauge with Threshold Coloring
+            color_yield = "green" if yield_pct > 95 else "orange" if yield_pct > 90 else "red"
+
+            fig_kpi.add_trace(go.Indicator(
+                mode="number+gauge", value=yield_pct,
+                title={"text": f"Yield %<br><span style='font-size:0.6em;color:gray'>{ci_text}</span>"},
+                gauge={'axis': {'range': [0, 100]}, 'bar': {'color': color_yield},
+                       'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 90}},
+                domain={'row': 0, 'column': 0}
+            ))
+            fig_kpi.add_trace(go.Indicator(
+                mode="number", value=total_units,
+                title={"text": "Total Units"},
+                domain={'row': 0, 'column': 1}
+            ))
+            fig_kpi.add_trace(go.Indicator(
+                mode="number", value=fail_count,
+                title={"text": "Failures"},
+                domain={'row': 0, 'column': 2}
+            ))
+            fig_kpi.update_layout(grid={'rows': 1, 'columns': 3, 'pattern': "independent"}, height=280)
+            figs_html.append(("Executive Summary", fig_kpi.to_html(full_html=False, include_plotlyjs='cdn')))
+
+            # --- FIG 2: Global Stability (The "Shock" Chart) ---
+            # Replicates logic from 'run_stress_analysis' to show which step caused the most drift
+            sheet_order = list(self.data_dict.keys())
+            if len(sheet_order) > 1:
+                step_labels = []
+                bucket_data = {"Stable (<1σ)": [], "Drifting (1-3σ)": [], "Unstable (>3σ)": []}
+
+                for i in range(len(sheet_order) - 1):
+                    step_name = f"{sheet_order[i]} → {sheet_order[i + 1]}"
+                    step_labels.append(step_name)
+
+                    df_pre = self.data_dict[sheet_order[i]]
+                    df_post = self.data_dict[sheet_order[i + 1]]
+
+                    # Find common numeric columns
+                    cols_pre = set(df_pre.select_dtypes(include=[np.number]).columns)
+                    cols_post = set(df_post.select_dtypes(include=[np.number]).columns)
+                    common = list(cols_pre & cols_post)
+                    if "SN" in common: common.remove("SN")
+
+                    shifts = []
+                    for col in common:
+                        s_pre = df_pre[col].std()
+                        if s_pre > 1e-9:
+                            # Standardized Shift
+                            shift = abs(df_post[col].mean() - df_pre[col].mean()) / s_pre
+                            shifts.append(shift)
+
+                    shifts = np.array(shifts)
+                    if len(shifts) > 0:
+                        bucket_data["Unstable (>3σ)"].append(np.sum(shifts > 3.0) / len(shifts) * 100)
+                        bucket_data["Drifting (1-3σ)"].append(
+                            np.sum((shifts >= 1.0) & (shifts <= 3.0)) / len(shifts) * 100)
+                        bucket_data["Stable (<1σ)"].append(np.sum(shifts < 1.0) / len(shifts) * 100)
+                    else:
+                        for k in bucket_data: bucket_data[k].append(0)
+
+                # Create Stacked Bar
+                fig_stress = go.Figure()
+                fig_stress.add_trace(go.Bar(name='Unstable (>3σ)', x=step_labels, y=bucket_data["Unstable (>3σ)"],
+                                            marker_color='#d62728'))
+                fig_stress.add_trace(go.Bar(name='Drifting (1-3σ)', x=step_labels, y=bucket_data["Drifting (1-3σ)"],
+                                            marker_color='#ff7f0e'))
+                fig_stress.add_trace(
+                    go.Bar(name='Stable (<1σ)', x=step_labels, y=bucket_data["Stable (<1σ)"], marker_color='#2ca02c'))
+
+                fig_stress.update_layout(barmode='stack', title="Global Process Stability (Shift per Step)",
+                                         yaxis_title="% of Parameters", height=400)
+                figs_html.append(
+                    ("Environmental Stress Impact", fig_stress.to_html(full_html=False, include_plotlyjs=False)))
+
+            # --- FIG 3: Pareto Chart ---
+            if self.failures:
+                fail_df = pd.DataFrame(self.failures)
+                counts = fail_df["Parameter"].value_counts().head(15).reset_index()
+                counts.columns = ["Parameter", "Count"]
+
+                fig_pareto = px.bar(counts, x="Count", y="Parameter", orientation='h',
+                                    title="Top 15 Failing Parameters", color="Count", color_continuous_scale="Reds")
+                fig_pareto.update_layout(yaxis={'categoryorder': 'total ascending'}, height=500)
+                figs_html.append(("Failure Pareto", fig_pareto.to_html(full_html=False, include_plotlyjs=False)))
+
+            # --- FIG 4: Cpk Histogram ---
+            if not df_cpk.empty:
+                df_cpk["Cpk_Viz"] = df_cpk["Cpk"].clip(upper=5.0)
+                fig_cpk = px.histogram(df_cpk, x="Cpk_Viz", nbins=40, title="Process Capability Distribution",
+                                       color_discrete_sequence=['#1f77b4'])
+                fig_cpk.add_vline(x=1.33, line_dash="dash", line_color="orange", annotation_text="1.33")
+                fig_cpk.add_vline(x=1.67, line_dash="dash", line_color="green", annotation_text="1.67")
+                fig_cpk.update_layout(height=400, xaxis_title="Cpk (Capped at 5.0)")
+                figs_html.append(("Cpk Health Check", fig_cpk.to_html(full_html=False, include_plotlyjs=False)))
+
+            # --- FIG 5: Worst-Case Drift Scatter (T0 vs Final) ---
+            # Automatically find the parameter with the worst drift and plot it
+            if self.measure_long is not None and len(sheet_order) >= 2:
+                # 1. Pivot Data
+                df_pivot = self.measure_long.pivot_table(index="SN", columns="Sheet", values="Value", aggfunc='first')
+                valid_sheets = [s for s in sheet_order if s in df_pivot.columns]
+
+                if len(valid_sheets) >= 2:
+                    col_start = valid_sheets[0]
+                    col_end = valid_sheets[-1]
+
+                    # 2. Find Worst Param (Max Mean Absolute Difference)
+                    # We iterate through parameters in the pivot to find the worst one
+                    # Note: measure_long has params, pivot has sheets.
+                    # We need to re-pivot by Parameter AND SN to do this efficiently,
+                    # but for speed, let's just use the 'Top Risks' list or scan numeric cols if small.
+
+                    # Faster approach: Scan the top 100 parameters from Cpk list (most likely to be important)
+                    candidates = df_cpk.head(50)["Param"].unique().tolist()
+                    worst_param = None
+                    max_drift = -1
+
+                    for p in candidates:
+                        sub = self.measure_long[self.measure_long["Parameter"] == p]
+                        if sub.empty: continue
+                        piv = sub.pivot_table(index="SN", columns="Sheet", values="Value")
+                        if col_start in piv and col_end in piv:
+                            d = (piv[col_end] - piv[col_start]).abs().mean()
+                            # Normalize by std?
+                            std = piv[col_start].std()
+                            score = d / std if std > 1e-9 else 0
+                            if score > max_drift:
+                                max_drift = score
+                                worst_param = p
+
+                    if worst_param:
+                        sub = self.measure_long[self.measure_long["Parameter"] == worst_param]
+                        piv = sub.pivot_table(index="SN", columns="Sheet", values="Value")
+
+                        fig_drift = px.scatter(piv, x=col_start, y=col_end, hover_name=piv.index,
+                                               title=f"Worst Drift Detected: {worst_param}",
+                                               opacity=0.6)
+
+                        # Add 45-degree line (No Drift Line)
+                        min_v = min(piv[col_start].min(), piv[col_end].min())
+                        max_v = max(piv[col_start].max(), piv[col_end].max())
+                        fig_drift.add_shape(type="line", x0=min_v, y0=min_v, x1=max_v, y1=max_v,
+                                            line=dict(color="Red", dash="dash"))
+
+                        fig_drift.update_layout(height=500, xaxis_title=f"Initial ({col_start})",
+                                                yaxis_title=f"Final ({col_end})")
+                        figs_html.append(
+                            ("Parametric Drift Analysis", fig_drift.to_html(full_html=False, include_plotlyjs=False)))
+
+            # --- FIG 6: Risk Trends (Box Plots) ---
+            if not top_risks.empty and self.measure_long is not None:
+                risk_params = top_risks["Param"].tolist()
+                trend_subset = self.measure_long[self.measure_long["Parameter"].isin(risk_params)].copy()
+
+                if not trend_subset.empty:
+                    fig_trend = px.box(trend_subset, x="Sheet", y="Value", color="Parameter",
+                                       title="Trend Analysis: Low Cpk Parameters",
+                                       points="outliers")
+                    fig_trend.update_layout(height=500)
+                    figs_html.append(
+                        ("Risk Parameter Trends", fig_trend.to_html(full_html=False, include_plotlyjs=False)))
+
+            # --- FIG 7: Correlation Heatmap (Top 30) ---
+            # To avoid browser lag, we pick the top 30 parameters with highest variance
+            if self.data_dict:
+                df_corr = self.data_dict[sheet_order[0]].select_dtypes(include=[np.number])
+                if "SN" in df_corr.columns: df_corr = df_corr.drop(columns=["SN"])
+
+                # Filter low variance columns
+                df_corr = df_corr.loc[:, df_corr.std() > 1e-9]
+
+                # Keep top 30 by variance (normalized)
+                if df_corr.shape[1] > 30:
+                    variances = df_corr.var() / df_corr.mean().abs()  # Coeff of Var
+                    top_vars = variances.sort_values(ascending=False).head(30).index
+                    df_corr = df_corr[top_vars]
+
+                if df_corr.shape[1] > 1:
+                    corr_matrix = df_corr.corr()
+                    fig_heat = px.imshow(corr_matrix, text_auto=".1f", aspect="auto",
+                                         color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                                         title=f"Correlation Matrix (Top {df_corr.shape[1]} Params)")
+                    fig_heat.update_layout(height=600)
+                    figs_html.append(
+                        ("Parameter Correlations", fig_heat.to_html(full_html=False, include_plotlyjs=False)))
+
+            # --- FIG 8: Multivariate Structure (PCA) ---
+            # Reuse logic for PCA
+            if self.measure_long is not None:
+                df_wide = self.measure_long.pivot_table(index="SN", columns="Parameter", values="Value", aggfunc='mean')
+                df_clean = df_wide.dropna(axis=1, how='any')
+                df_clean = df_clean.loc[:, df_clean.std() > 1e-9]
+
+                if df_clean.shape[1] > 2:
+                    from sklearn.decomposition import PCA
+                    from sklearn.preprocessing import StandardScaler
+                    from scipy.spatial import distance
+
+                    scaler = StandardScaler()
+                    X_scaled = scaler.fit_transform(df_clean)
+                    pca = PCA(n_components=2)
+                    X_pca = pca.fit_transform(X_scaled)
+
+                    cov = np.cov(X_pca.T)
+                    inv_cov = np.linalg.inv(cov)
+                    mean_pca = X_pca.mean(axis=0)
+                    m_dists = [distance.mahalanobis(x, mean_pca, inv_cov) for x in X_pca]
+
+                    viz_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"], index=df_clean.index)
+                    viz_df["Mahalanobis"] = m_dists
+                    # Chi2 threshold for 2 dof at 99.9% is ~3.71 (sqrt(13.8))
+                    limit = np.sqrt(stats.chi2.ppf(0.999, 2))
+                    viz_df["IsOutlier"] = viz_df["Mahalanobis"] > limit
+                    viz_df["SN"] = viz_df.index
+
+                    fig_pca = px.scatter(viz_df, x="PC1", y="PC2", color="Mahalanobis",
+                                         hover_data=["SN", "IsOutlier"],
+                                         title="Multivariate Structure (PCA Projection)",
+                                         color_continuous_scale="Viridis")
+                    fig_pca.add_shape(type="circle", xref="x", yref="y",
+                                      x0=-limit, y0=-limit, x1=limit, y1=limit,
+                                      line_color="Red", line_dash="dot")
+
+                    fig_pca.update_layout(height=500)
+                    figs_html.append(
+                        ("Population Structure (PCA)", fig_pca.to_html(full_html=False, include_plotlyjs=False)))
+
+            # ==========================================
+            # 3. HTML ASSEMBLY
+            # ==========================================
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>Qualification Analysis Report</title>
+                <style>
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; color: #333; margin: 0; padding: 20px; }}
+                    .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 40px; box-shadow: 0 0 10px rgba(0,0,0,0.1); border-radius: 8px; }}
+                    h1 {{ text-align: center; color: #2c3e50; margin-bottom: 5px; }}
+                    .timestamp {{ text-align: center; color: #7f8c8d; margin-bottom: 40px; font-size: 0.9em; }}
+                    .section {{ margin-bottom: 60px; border-bottom: 1px solid #eee; padding-bottom: 20px; }}
+                    h2 {{ color: #34495e; border-left: 5px solid #3498db; padding-left: 10px; margin-bottom: 20px; }}
+                    .footer {{ text-align: center; font-size: 12px; color: #aaa; margin-top: 50px; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>Microcircuit Qualification Report</h1>
+                    <div class="timestamp">Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+            """
+
+            for title, plot_html in figs_html:
+                html_content += f"""
+                    <div class="section">
+                        <h2>{title}</h2>
+                        {plot_html}
+                    </div>
+                """
+
+            html_content += """
+                    <div class="footer">Generated by QualAnalyzer V2.2 (Python/Plotly)</div>
+                </div>
+            </body>
+            </html>
+            """
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+
+            messagebox.showinfo("Success", f"Interactive Report Saved!\n{path}")
+            self.lbl_status.config(text="Report Generation Complete.")
+
+        except Exception as e:
+            messagebox.showerror("Report Error", f"Failed to generate HTML:\n{str(e)}")
+            self.lbl_status.config(text="Report Failed.")
+            import traceback
+            traceback.print_exc()
+
+    def generate_universal_explorer(self):
+        """
+        Generates the 'Ultimate' Data Explorer HTML.
+
+        FEATURES:
+        - 5 Chart Modes: Box+Jitter, Violin, Scatter, Line, Histogram.
+        - X-Axis Toggle: Switch between 'Test Step' (Sheet) and 'Serial Number' (SN).
+        - Consolidated Params: Merges R/C/H into one base parameter.
+        - Rich Interaction: Hover templates, Range Sliders, Zoom.
+        """
+        if not PLOTLY_AVAILABLE:
+            messagebox.showerror("Error", "Plotly is required. Pip install plotly.")
+            return
+
+        if self.measure_long is None or self.measure_long.empty:
+            messagebox.showinfo("Error", "No data loaded.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML Files", "*.html")],
+            title="Save Universal Data Explorer"
+        )
+        if not path: return
+
+        self.lbl_status.config(text="Building Ultimate Explorer...")
+        self.root.update_idletasks()
+
+        try:
+            # 1. Prepare Data
+            df = self.measure_long.copy()
+            df["Base"] = df["Parameter"].apply(self._get_base)
+
+            def get_temp_category(p_name):
+                lower = p_name.lower()
+                if "hot" in lower: return "Hot"
+                if "cold" in lower: return "Cold"
+                return "Room"
+
+            df["Temp"] = df["Parameter"].apply(get_temp_category)
+
+            # Sort for consistent line plots
+            df = df.sort_values(by=["Sheet", "SN"])
+
+            unique_bases = sorted(df["Base"].unique())
+
+            # 2. Setup Colors & Styles
+            fig = go.Figure()
+            color_map = {"Room": "#7f7f7f", "Cold": "#1f77b4", "Hot": "#ff7f0e"}
+
+            # STORAGE FOR X-AXIS SWITCHING
+            all_x_sheets = []
+            all_x_sns = []
+
+            # 3. Generate Traces
+            traces_per_base = []
+
+            for base in unique_bases:
+                sub = df[df["Base"] == base]
+                available_temps = [t for t in ["Cold", "Room", "Hot"] if t in sub["Temp"].unique()]
+
+                is_visible = (base == unique_bases[0])
+                count = 0
+
+                for t in available_temps:
+                    t_sub = sub[sub["Temp"] == t]
+
+                    all_x_sheets.append(t_sub["Sheet"].tolist())
+                    all_x_sns.append(t_sub["SN"].tolist())
+
+                    fig.add_trace(go.Box(
+                        x=t_sub["Sheet"],
+                        y=t_sub["Value"],
+                        name=t,
+                        marker_color=color_map.get(t, "black"),
+                        visible=is_visible,
+                        boxpoints='all',
+                        jitter=0.5,
+                        pointpos=-1.8,
+                        customdata=np.stack((t_sub['SN'], t_sub['Sheet']), axis=-1),
+                        hovertemplate="<b>SN: %{customdata[0]}</b><br>Sheet: %{customdata[1]}<br>Value: %{y}<extra></extra>"
+                    ))
+                    count += 1
+                traces_per_base.append(count)
+
+            # 4. MENU A: Parameter Selection
+            param_buttons = []
+            current_idx = 0
+            total_traces = len(fig.data)
+
+            for i, base in enumerate(unique_bases):
+                n_traces = traces_per_base[i]
+                mask = [False] * total_traces
+                for j in range(current_idx, current_idx + n_traces): mask[j] = True
+
+                unit = ""
+                for s in self.units_dict:
+                    for p_full, u_val in self.units_dict[s].items():
+                        if base in p_full:
+                            unit = f" ({u_val})"
+                            break
+                    if unit: break
+
+                param_buttons.append(dict(
+                    label=base, method="update",
+                    args=[{"visible": mask}, {"title": f"Analysis: {base}", "yaxis.title": f"Value{unit}"}]
+                ))
+                current_idx += n_traces
+
+            # 5. MENU B: Chart Mode Selection
+            mode_buttons = [
+                dict(label="📊 Box & Jitter", method="restyle",
+                     args=[{"type": "box", "boxpoints": "all", "jitter": 0.5}]),
+                dict(label="🎻 Violin Plot", method="restyle",
+                     args=[{"type": "violin", "points": "all", "side": "positive", "box": {"visible": True}}]),
+                dict(label="🔵 Pure Scatter", method="restyle", args=[{"type": "scatter", "mode": "markers"}]),
+                dict(label="📈 Line Trend", method="restyle", args=[{"type": "scatter", "mode": "lines+markers"}]),
+            ]
+
+            # 6. MENU C: X-Axis Toggle
+            axis_buttons = [
+                dict(label="Group by Test Step", method="restyle", args=[{"x": all_x_sheets}]),
+                dict(label="Group by Serial Num", method="restyle", args=[{"x": all_x_sns}])
+            ]
+
+            # 7. Final Layout
+            fig.update_layout(
+                title=f"Analysis: {unique_bases[0]}",
+                yaxis_title="Value",
+                template="plotly_white",
+                height=800,
+                boxmode='group',
+                violinmode='group',
+                xaxis=dict(rangeslider=dict(visible=True), type="category"),
+                updatemenus=[
+                    dict(active=0, buttons=param_buttons, x=0.0, y=1.15, yanchor="top"),
+                    dict(active=0, buttons=mode_buttons, x=0.35, y=1.15, yanchor="top"),
+                    dict(active=0, buttons=axis_buttons, x=0.65, y=1.15, yanchor="top")
+                ]
+            )
+
+            fig.write_html(path, include_plotlyjs='cdn')
+            messagebox.showinfo("Success", f"Universal Explorer Saved!\n{path}")
+            self.lbl_status.config(text="Export Complete.")
+
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def launch_internal_dashboard(self):
+        """
+        Launches the 'Mission Control' Dash App (V5).
+
+        UPGRADES:
+        1. Limits: Deep Dive now draws color-coded limits PER TEMPERATURE (no more single red line).
+        2. Executive Table: Fixed "Crossed Limits" bug (Min=97, Max=-52) by showing Global Window.
+        3. New Tab: 'Correlation Analysis' (X vs Y Scatter) with unit-history crossover.
+        """
+        if not DASH_AVAILABLE:
+            messagebox.showerror("Error",
+                                 "Dash/Plotly required.\npip install dash dash-bootstrap-components pandas plotly sklearn")
+            return
+
+        if self.measure_long is None or self.measure_long.empty:
+            messagebox.showinfo("Error", "No data loaded.")
+            return
+
+        self.lbl_status.config(text="Launching Mission Control V5...")
+        self.root.update_idletasks()
+
+        # ==========================================
+        # 1. DATA PREP
+        # ==========================================
+        df = self.measure_long.copy()
+
+        # Merge Limits if missing
+        if "LSL" not in df.columns or "USL" not in df.columns:
+            if hasattr(self, 'limit_long') and self.limit_long is not None and not self.limit_long.empty:
+                df = pd.merge(df, self.limit_long, on=["Sheet", "Parameter"], how="left")
+            else:
+                df["LSL"] = np.nan
+                df["USL"] = np.nan
+
+        for col in ["Value", "LSL", "USL"]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        df["Base"] = df["Parameter"].apply(self._get_base)
+
+        def get_temp(p):
+            if "hot" in p.lower(): return "Hot"
+            if "cold" in p.lower(): return "Cold"
+            return "Room"
+
+        df["Temp"] = df["Parameter"].apply(get_temp)
+
+        unique_bases = sorted(df["Base"].unique())
+
+        # PRE-CALC FAILURES (Row-by-Row)
+        # This ensures fail counts are accurate even if limits vary by temp
+        df["is_fail"] = False
+        mask_low = (~df["LSL"].isna()) & (df["Value"] < df["LSL"])
+        mask_high = (~df["USL"].isna()) & (df["Value"] > df["USL"])
+        df.loc[mask_low | mask_high, "is_fail"] = True
+
+        # ==========================================
+        # 2. STATS CALCULATION (Executive Table)
+        # ==========================================
+        summary_rows = []
+        for base in unique_bases:
+            sub = df[df["Base"] == base]
+            if sub.empty: continue
+
+            vals = sub["Value"].dropna()
+            if vals.empty: continue
+
+            # FIX: Use Min(LSL) and Max(USL) to show the "Global Operating Window"
+            # This prevents the "Min=97, Max=-50" inversion bug.
+            disp_lsl = sub["LSL"].min()
+            disp_usl = sub["USL"].max()
+
+            fails = sub["is_fail"].sum()
+
+            summary_rows.append({
+                "Parameter": base,
+                "Min Limit": disp_lsl,
+                "Max Limit": disp_usl,
+                "Mean": round(vals.mean(), 4),
+                "Std Dev": round(vals.std(), 4),
+                "Fails": fails,
+                "Passes": len(vals) - fails
+            })
+        df_summary = pd.DataFrame(summary_rows)
+
+        # ==========================================
+        # 3. DEFINE DASHBOARD STRUCTURE
+        # ==========================================
+
+        # TAB 1: EXECUTIVE
+        tab1_content = [
+            dbc.Row([
+                dbc.Col(dbc.Card([
+                    dbc.CardHeader("Statistical Summary (Select Row to Analyze)"),
+                    dbc.CardBody([
+                        dash.dash_table.DataTable(
+                            id='summary-table',
+                            columns=[
+                                {"name": "Parameter", "id": "Parameter"},
+                                {"name": "Min Limit", "id": "Min Limit"},
+                                {"name": "Max Limit", "id": "Max Limit"},
+                                {"name": "Mean", "id": "Mean"},
+                                {"name": "Std Dev", "id": "Std Dev"},
+                                {"name": "Fails", "id": "Fails"}
+                            ],
+                            data=df_summary.to_dict('records'),
+                            row_selectable="single",
+                            filter_action="native",
+                            sort_action="native",
+                            page_size=12,
+                            style_table={'overflowX': 'auto'},
+                            style_header={'backgroundColor': '#222', 'color': 'white', 'fontWeight': 'bold'},
+                            style_cell={'backgroundColor': '#333', 'color': 'white', 'textAlign': 'left'},
+                            style_data_conditional=[
+                                {'if': {'filter_query': '{Fails} > 0'}, 'backgroundColor': '#5c2b2b', 'color': 'white'}
+                            ]
+                        )
+                    ])
+                ], color="dark", inverse=True), width=12)
+            ])
+        ]
+
+        # TAB 2: DEEP DIVE
+        tab2_content = [
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Select Parameter:", className="text-white"),
+                    dcc.Dropdown(id='param-dropdown', options=unique_bases,
+                                 value=unique_bases[0] if unique_bases else None, className="text-dark"),
+                ], width=6),
+                dbc.Col([
+                    html.Label("Options:", className="text-white"),
+                    dbc.Checklist(
+                        options=[{"label": "Show Limits", "value": 1}, {"label": "Log Scale", "value": 2}],
+                        value=[1], id="chart-options", switch=True, inline=True, className="text-white"
+                    ),
+                ], width=6)
+            ], className="my-3"),
+
+            dbc.Row([
+                dbc.Col(dbc.Card(dcc.Graph(id='main-trend', style={'height': '500px'}), body=True, color="secondary"),
+                        width=8),
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardHeader("Unit History (Hover on Charts)"),
+                        dbc.CardBody(dcc.Graph(id='drift-plot', style={'height': '250px'}))
+                    ], className="mb-2", color="dark", inverse=True),
+                    dbc.Card([
+                        dbc.CardHeader("Distribution (KDE)"),
+                        dbc.CardBody(dcc.Graph(id='kde-plot', style={'height': '200px'}))
+                    ], color="dark", inverse=True)
+                ], width=4)
+            ])
+        ]
+
+        # TAB 3: CORRELATION (New Feature)
+        tab3_content = [
+            dbc.Row([
+                dbc.Col([
+                    html.Label("X Axis Parameter:", className="text-white"),
+                    dcc.Dropdown(id='corr-x-dropdown', options=unique_bases,
+                                 value=unique_bases[0] if unique_bases else None, className="text-dark"),
+                ], width=6),
+                dbc.Col([
+                    html.Label("Y Axis Parameter:", className="text-white"),
+                    dcc.Dropdown(id='corr-y-dropdown', options=unique_bases,
+                                 value=unique_bases[1] if len(unique_bases) > 1 else unique_bases[0],
+                                 className="text-dark"),
+                ], width=6)
+            ], className="my-3"),
+
+            dbc.Row([
+                dbc.Col(dbc.Card(dcc.Graph(id='corr-scatter', style={'height': '600px'}), body=True, color="secondary"),
+                        width=12)
+            ])
+        ]
+
+        # ==========================================
+        # 4. INIT APP
+        # ==========================================
+        app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+        app.title = "Qual Mission Control"
+
+        app.layout = dbc.Container([
+            dbc.NavbarSimple(brand="Microcircuit Qual Mission Control", color="primary", dark=True, className="mb-3"),
+            dbc.Tabs([
+                dbc.Tab(tab1_content, label="Executive Dashboard", tab_id="tab-exec"),
+                dbc.Tab(tab2_content, label="Parametric Deep Dive", tab_id="tab-deep"),
+                dbc.Tab(tab3_content, label="Correlation Analysis", tab_id="tab-corr"),
+            ], id='tabs-main', active_tab="tab-exec")
+        ], fluid=True)
+
+        # ==========================================
+        # 5. CALLBACKS
+        # ==========================================
+
+        # A. Navigation (Table -> Deep Dive)
+        @app.callback(
+            [Output('tabs-main', 'active_tab'), Output('param-dropdown', 'value')],
+            [Input('summary-table', 'selected_rows'), Input('summary-table', 'data')],
+            prevent_initial_call=True
+        )
+        def jump_to_param(selected_rows, data):
+            if not selected_rows: return no_update, no_update
+            return "tab-deep", data[selected_rows[0]]['Parameter']
+
+        # B. Deep Dive Charts (The Logic Upgrade)
+        @app.callback(
+            [Output('main-trend', 'figure'), Output('kde-plot', 'figure')],
+            [Input('param-dropdown', 'value'), Input('chart-options', 'value')]
+        )
+        def update_deep_dive(param, options):
+            if not param: return no_update, no_update
+            sub = df[df["Base"] == param]
+
+            show_lims = (options and 1 in options)
+            log_scale = (options and 2 in options)
+            colors = {"Room": "#bdc3c7", "Cold": "#3498db", "Hot": "#e67e22"}
+            limit_colors = {"Room": "white", "Cold": "#3498db", "Hot": "#e67e22"}
+
+            # Main Trend
+            fig_main = go.Figure()
+
+            # Draw Data & Limits per Temp
+            for t in ["Cold", "Room", "Hot"]:
+                t_dat = sub[sub["Temp"] == t]
+                if t_dat.empty: continue
+
+                # 1. Box Trace
+                fig_main.add_trace(go.Box(
+                    x=t_dat["Sheet"], y=t_dat["Value"], name=t,
+                    marker_color=colors.get(t, "white"),
+                    boxpoints='all', jitter=0.5, pointpos=-1.8,
+                    customdata=t_dat["SN"], hovertemplate="SN: %{customdata}<br>Val: %{y}<extra></extra>"
+                ))
+
+                # 2. Per-Temperature Limits (Correct Visuals)
+                if show_lims:
+                    # Get limits for this specific temp group
+                    # We take the mode or max, assuming limits are constant per step/temp
+                    lsl = t_dat["LSL"].max()
+                    usl = t_dat["USL"].min()
+
+                    if not pd.isna(lsl):
+                        fig_main.add_hline(y=lsl, line_dash="dash", line_color=limit_colors.get(t),
+                                           opacity=0.7, annotation_text=f"{t} LSL")
+                    if not pd.isna(usl):
+                        fig_main.add_hline(y=usl, line_dash="dash", line_color=limit_colors.get(t),
+                                           opacity=0.7, annotation_text=f"{t} USL")
+
+            fig_main.update_layout(
+                title=f"Trend Analysis: {param}", template="plotly_dark",
+                yaxis_type="log" if log_scale else "linear",
+                legend=dict(orientation="h", y=1.1)
+            )
+
+            # KDE Plot
+            fig_kde = go.Figure()
+            for t in ["Cold", "Room", "Hot"]:
+                t_dat = sub[sub["Temp"] == t]
+                if t_dat.empty: continue
+                fig_kde.add_trace(go.Histogram(
+                    x=t_dat["Value"], name=t, marker_color=colors.get(t), opacity=0.6
+                ))
+            fig_kde.update_layout(barmode="overlay", template="plotly_dark", showlegend=False,
+                                  margin=dict(l=0, r=0, t=0, b=0))
+
+            return fig_main, fig_kde
+
+        # C. Correlation Chart (New Feature)
+        @app.callback(
+            Output('corr-scatter', 'figure'),
+            [Input('corr-x-dropdown', 'value'), Input('corr-y-dropdown', 'value')]
+        )
+        def update_correlation(p1, p2):
+            if not p1 or not p2: return go.Figure()
+
+            # Need to align data by SN and Sheet
+            # Filter
+            d1 = df[df["Base"] == p1][["SN", "Sheet", "Temp", "Value"]].rename(columns={"Value": "X"})
+            d2 = df[df["Base"] == p2][["SN", "Sheet", "Temp", "Value"]].rename(columns={"Value": "Y"})
+
+            merged = pd.merge(d1, d2, on=["SN", "Sheet", "Temp"])
+
+            fig = px.scatter(
+                merged, x="X", y="Y", color="Temp",
+                hover_data=["SN", "Sheet"],
+                color_discrete_map={"Room": "#bdc3c7", "Cold": "#3498db", "Hot": "#e67e22"},
+                title=f"Correlation: {p1} vs {p2}"
+            )
+            fig.update_layout(template="plotly_dark")
+            return fig
+
+        # D. Universal Drift History (Triggered by BOTH Main Chart and Correlation Chart)
+        @app.callback(
+            Output('drift-plot', 'figure'),
+            [Input('main-trend', 'hoverData'), Input('corr-scatter', 'hoverData'), Input('param-dropdown', 'value')]
+        )
+        def update_drift(hover_main, hover_corr, current_param):
+            ctx = dash.callback_context
+            if not ctx.triggered: return go.Figure()
+
+            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+            target_sn = None
+
+            try:
+                if trigger_id == 'main-trend' and hover_main:
+                    target_sn = str(hover_main['points'][0]['customdata'])
+                elif trigger_id == 'corr-scatter' and hover_corr:
+                    target_sn = str(hover_corr['points'][0]['customdata'][0])  # SN is usually first customdata
+            except:
+                pass
+
+            if not target_sn:
+                return go.Figure().add_annotation(text="Hover on charts", showarrow=False).update_layout(
+                    template="plotly_dark")
+
+            # Plot history for the CURRENTLY SELECTED parameter
+            hist = df[(df["Base"] == current_param) & (df["SN"].astype(str) == target_sn)].sort_values("Sheet")
+
+            fig = px.line(hist, x="Sheet", y="Value", color="Temp", markers=True,
+                          title=f"Unit {target_sn} ({current_param})")
+            fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+            return fig
+
+        # --- RUN SERVER ---
+        def run_server():
+            try:
+                app.run(debug=False, use_reloader=False, port=8050, host='127.0.0.1')
+            except Exception as e:
+                print(e)
+
+        t = threading.Thread(target=run_server)
+        t.daemon = True
+        t.start()
+
+        from threading import Timer
+        def open_browser():
+            webbrowser.open("http://127.0.0.1:8050")
+
+        Timer(1.5, open_browser).start()
+
+        self.lbl_status.config(text="Mission Control V5 Live: http://127.0.0.1:8050")
 
 if __name__ == "__main__":
     root = tk.Tk()
